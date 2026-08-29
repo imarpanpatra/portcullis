@@ -9,6 +9,24 @@ Create it with:
 cd sdk && npm install && npm run create-agent
 ```
 
+That one command registers three things, because an agent spec only *references*
+its connectors and skills by name. A reference to a skill the server has never been
+told about produces an agent that cannot load its own procedure, so the reference
+and the registration have to travel together:
+
+| Registered | How |
+| --- | --- |
+| `portcullis` connector | `PUT /api/v1/settings/mcp-servers`, pointed at the local MCP server |
+| `supply-chain-audit` skill | `PUT /api/v1/settings/skills`, git-backed and cloned into the sandbox on demand |
+| `portcullis` agent | `client.agents.create` / `update` |
+
+`PUT` is create-or-replace, so the script is safe to re-run.
+
+The **GitHub connector is the one piece this cannot set up**: it is an OAuth catalog
+entry, so a person has to authorise it under Settings → Connectors. The script
+checks for it and warns loudly rather than quietly creating an agent whose write
+path does not exist.
+
 ## Why this is created through the SDK and not the chat UI
 
 The chat UI covers model, instructions, connectors, skills, and the sandbox toggle.
