@@ -1,0 +1,17 @@
+{
+  "name": "portcullis-sdk",
+  "version": "1.0.0",
+  "scripts": {
+    "create-agent": "node create-agent.mjs",
+    "audit": "node audit.mjs"
+  },
+  "description": "Creates the Portcullis agent and drives an audit session, including the approval pause.",
+  "dependencies": {
+    "@truefoundry/trueforge-sdk": "^0.1.3"
+  },
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.14"
+  }
+}
