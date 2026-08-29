@@ -230,6 +230,57 @@ def read_text(path):
         return None
 
 
+def has_shebang(full_path):
+    try:
+        with open(full_path, "rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+def looks_binary(full_path):
+    """A NUL byte in the first block is the usual heuristic for "not text"."""
+    try:
+        with open(full_path, "rb") as handle:
+            return 0 in handle.read(1024)
+    except OSError:
+        return False
+
+
+def is_compilable(relative_path):
+    """A .ts file is compilable source; a .d.ts is a type declaration and compiles to
+    nothing. Counting declarations as evidence of a build step would let a plain
+    JavaScript repository that merely ships typings be treated as built, which
+    quietly downgrades every provenance finding against it."""
+    lower = relative_path.lower()
+    return lower.endswith(COMPILABLE_SUFFIXES) and not lower.endswith(DECLARATION_SUFFIXES)
+
+
+def file_kind(relative_path, full_path):
+    """Classify a file for scanning and comparison.
+
+    Extension matching is case-insensitive, and files with no extension at all are
+    classified by content. Both matter: npm bin entries routinely have no suffix,
+    and a lifecycle hook running `sh install` does not care what the file is called.
+    An allowlist of lowercase extensions would let either ship unexamined.
+    """
+    lower = relative_path.lower()
+    if lower.endswith(DECLARATION_SUFFIXES):
+        return "skip"
+    if lower.endswith(SOURCE_SUFFIXES):
+        return "source"
+    if lower.endswith(SCRIPT_SUFFIXES):
+        return "script"
+    if lower.endswith(BINARY_SUFFIXES):
+        return "binary"
+    if "." not in relative_path.rsplit("/", 1)[-1]:
+        if looks_binary(full_path):
+            return "binary"
+        if has_shebang(full_path):
+            return "script"
+    return "skip"
+
+
 def is_build_path(relative_path):
     parts = set(relative_path.split("/")[:-1])
     return bool(parts & BUILD_DIR_PARTS) or relative_path.endswith((".min.js", ".min.mjs"))
@@ -351,7 +402,9 @@ def scan_sources(root):
             truncated = True
             break
 
-        if relative.endswith(BINARY_SUFFIXES):
+        kind = file_kind(relative, full)
+
+        if kind == "binary":
             findings.append(
                 Finding(
                     "binary_artifact",
@@ -365,7 +418,7 @@ def scan_sources(root):
 
         # Only executable source is scanned. package.json is the manifest check's job,
         # and .d.ts files never run, so a URL in one is a documentation link.
-        if not relative.endswith(SCANNABLE_SUFFIXES) or relative.endswith(DECLARATION_SUFFIXES):
+        if kind not in ("source", "script"):
             continue
 
         text = read_text(full)
@@ -487,7 +540,7 @@ def index_repository(repo_root):
         by_stem.setdefault(stem_of(relative), []).append(relative)
         if relative.rsplit("/", 1)[-1] in BUILD_CONFIG_FILES:
             is_built = True
-        if relative.endswith(COMPILABLE_SUFFIXES):
+        if is_compilable(relative):
             is_built = True
 
     return by_path, by_stem, is_built
@@ -515,14 +568,22 @@ def compare_with_source(npm_root, repo_bytes):
     """
     findings = []
     with tempfile.TemporaryDirectory() as workspace:
-        safe_extract(repo_bytes, workspace)
+        repo_extraction = safe_extract(repo_bytes, workspace)
         repo_root = package_root(workspace)
         by_path, by_stem, repo_is_built = index_repository(repo_root)
+
+        # If the repository tree was itself truncated, "absent from the repository"
+        # stops meaning anything -- the file may simply be past the cutoff. Findings
+        # are still emitted, because staying silent would hide real ones, but none of
+        # them can be claimed with confidence while the baseline is incomplete.
+        repo_truncated = repo_extraction["truncated"]
 
         relocated = 0
         compiled_counterpart = 0
 
         def severity_for_missing(relative):
+            if repo_truncated:
+                return "low"
             # A plain-JavaScript package should mirror its repository, so an unmatched
             # file is close to damning. A project that compiles can rename on the way
             # out -- esbuild publishes lib/npm/node-install.ts as install.js -- and no
@@ -535,7 +596,11 @@ def compare_with_source(npm_root, repo_bytes):
             return "low" if is_build_path(relative) else "medium"
 
         for relative, full in walk_files(npm_root):
-            if not relative.endswith(SOURCE_SUFFIXES) or relative.endswith(DECLARATION_SUFFIXES):
+            # Shell scripts get provenance too. A tarball-only install.sh is exactly
+            # the file a lifecycle hook reaches for, and checking it only against a
+            # handful of regexes while never asking whether it exists upstream would
+            # leave the strongest finding in this tool unavailable against it.
+            if file_kind(relative, full) not in ("source", "script"):
                 continue
 
             published = content_hash(full)
@@ -582,7 +647,7 @@ def compare_with_source(npm_root, repo_bytes):
                 )
                 continue
 
-            compilable = [c for c in candidates if c.endswith(COMPILABLE_SUFFIXES)]
+            compilable = [c for c in candidates if is_compilable(c)]
             if repo_is_built and len(compilable) == 1:
                 # Compiled output never matches its source byte for byte, so this
                 # cannot be verified -- only noted, and at the lowest severity.
@@ -620,6 +685,8 @@ def compare_with_source(npm_root, repo_bytes):
             "relocated_files": relocated,
             "compiled_from_source_files": compiled_counterpart,
             "repo_has_build_step": repo_is_built,
+            "repo_tree_truncated": bool(repo_truncated),
+            "repo_truncation_reason": repo_truncated,
         }
 
 
@@ -701,6 +768,12 @@ def main():
                 report["findings"].extend(diff_findings)
                 report["stats"].update(diff_stats)
                 report["stats"]["compared_against_source"] = True
+                if diff_stats.get("repo_tree_truncated"):
+                    report["limitations"].append(
+                        "The repository tree was only partially unpacked ("
+                        f"{diff_stats['repo_truncation_reason']}), so absence from it is not "
+                        "reliable evidence. Provenance findings are capped at low severity."
+                    )
             except Exception as error:  # noqa: BLE001
                 report["limitations"].append(f"Source comparison failed: {error}")
 

