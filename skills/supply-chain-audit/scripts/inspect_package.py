@@ -8,8 +8,8 @@ isolated rather than on the reviewer's laptop.
 It never executes the package. It downloads, unpacks, reads, and compares.
 
 Standard library only, so it runs on any sandbox image with Python 3 and needs no
-install step of its own -- which would be a poor look for a tool whose whole
-subject is install steps.
+install step of its own -- which would be a poor look for a tool whose subject is
+install steps.
 
 Usage:
     python3 inspect_package.py --name express --version 5.2.1 \
@@ -33,14 +33,29 @@ import urllib.request
 
 USER_AGENT = "portcullis-inspector"
 NETWORK_TIMEOUT = 30
+
+# The download cap bounds *compressed* bytes. A hostile archive can be small and
+# expand without limit, so extraction is bounded separately, by member count, by
+# individual member size, and by cumulative decompressed bytes.
 MAX_DOWNLOAD_BYTES = 80 * 1024 * 1024
+MAX_MEMBERS = 5000
+MAX_MEMBER_BYTES = 20 * 1024 * 1024
+MAX_EXTRACTED_BYTES = 150 * 1024 * 1024
+
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_FILES_SCANNED = 3000
 
 SOURCE_SUFFIXES = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")
 DECLARATION_SUFFIXES = (".d.ts", ".d.mts", ".d.cts")
 COMPILABLE_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".jsx", ".coffee")
-EXECUTABLE_SUFFIXES = (".node", ".exe", ".dll", ".so", ".dylib", ".sh", ".bat", ".ps1", ".cmd")
+
+# Shell and batch files are text. They were previously lumped in with compiled
+# artifacts and skipped, which meant a postinstall calling install.sh containing
+# `curl ... | bash` never reached the pattern that exists to catch exactly that.
+SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd")
+BINARY_SUFFIXES = (".node", ".exe", ".dll", ".so", ".dylib", ".wasm", ".bin")
+
+SCANNABLE_SUFFIXES = SOURCE_SUFFIXES + SCRIPT_SUFFIXES
 
 # Minified bundles in a build directory are normal and would otherwise dominate the
 # obfuscation checks, so those paths are held to a looser standard.
@@ -65,8 +80,26 @@ PATTERNS = {
         r"""require\s*\(\s*['"](net|dgram|tls|dns)['"]|from\s+['"](net|dgram|tls|dns)['"]"""
     ),
     "pipe_to_shell": re.compile(r"(curl|wget)\b[^\n]{0,100}\|\s*(bash|sh|node|python)"),
-    "env_harvest": re.compile(r"process\.env\s*(\[|\.[A-Z_]{3,})"),
 }
+
+SEVERITY_BY_CHECK = {
+    "pipe_to_shell": "critical",
+    "process_execution": "high",
+    "raw_socket": "high",
+    "dynamic_eval": "medium",
+    "long_encoded_literal": "medium",
+    "char_code_assembly": "medium",
+}
+
+# Environment reads are matched separately from the table above because the useful
+# quantity is how many *distinct variables* a file touches, which means capturing
+# the names. Both notations have to be captured: a regex that matches only the
+# opening bracket collapses every process.env["..."] access into one value, and a
+# file reading a dozen secrets that way would never cross the threshold.
+ENV_ACCESS = re.compile(
+    r"""process\.env\.([A-Za-z_$][\w$]*)|process\.env\[\s*['"]([^'"]+)['"]\s*\]"""
+)
+ENV_DISTINCT_THRESHOLD = 3
 
 HEX_ESCAPE = re.compile(r"\\x[0-9a-fA-F]{2}")
 URL_LITERAL = re.compile(r"https?://([a-zA-Z0-9.\-]+)")
@@ -105,18 +138,31 @@ def fetch(url):
 
 
 def safe_extract(archive_bytes, destination):
-    """Extract a tar.gz, refusing members that would write outside the destination.
+    """Extract a tar.gz, refusing members that would escape or exhaust the sandbox.
 
-    A tarball is attacker-controlled input. A member named ../../.bashrc, or an
-    absolute path, or a symlink pointing outside the tree, would let the archive
-    write wherever it liked -- and this tool exists precisely because the archive
-    may be hostile. Every member is resolved and checked before extraction.
+    A tarball is attacker-controlled input, in two different ways.
+
+    It can try to write outside the destination -- a member named ../../.bashrc, an
+    absolute path, or a symlink pointing at /etc/passwd. Every member is resolved
+    against the destination and rejected if it escapes.
+
+    It can also be a decompression bomb. The download cap only bounds compressed
+    bytes, and a few megabytes of gzip expands to as much as the attacker likes, so
+    member count, individual member size, and cumulative extracted bytes are all
+    capped here. Hitting a cap stops extraction and is reported, never ignored: a
+    partial unpack that looks like a complete one is exactly the kind of quiet
+    failure this tool is supposed to expose.
     """
     destination = os.path.realpath(destination)
     extracted = 0
+    total_bytes = 0
+    truncated = None
 
     with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as tar:
-        for member in tar.getmembers():
+        for index, member in enumerate(tar):
+            if index >= MAX_MEMBERS:
+                truncated = f"Archive has more than {MAX_MEMBERS} members; extraction stopped."
+                break
             if member.issym() or member.islnk():
                 continue  # links are never needed to read a package's contents
             if not (member.isfile() or member.isdir()):
@@ -127,6 +173,19 @@ def safe_extract(archive_bytes, destination):
             target = os.path.realpath(os.path.join(destination, member.name))
             if target != destination and not target.startswith(destination + os.sep):
                 continue  # path traversal attempt
+
+            if member.isfile():
+                if member.size > MAX_MEMBER_BYTES:
+                    truncated = (
+                        f"{member.name} is larger than {MAX_MEMBER_BYTES} bytes and was skipped."
+                    )
+                    continue
+                if total_bytes + member.size > MAX_EXTRACTED_BYTES:
+                    truncated = (
+                        f"Unpacked size passed {MAX_EXTRACTED_BYTES} bytes; extraction stopped."
+                    )
+                    break
+                total_bytes += member.size
 
             # `filter="data"` adds the interpreter's own hardening, but only exists on
             # Python 3.12+. The checks above are the ones this tool relies on, so an
@@ -139,7 +198,7 @@ def safe_extract(archive_bytes, destination):
             if member.isfile():
                 extracted += 1
 
-    return extracted
+    return {"files": extracted, "bytes": total_bytes, "truncated": truncated}
 
 
 def package_root(directory):
@@ -176,19 +235,40 @@ def is_build_path(relative_path):
     return bool(parts & BUILD_DIR_PARTS) or relative_path.endswith((".min.js", ".min.mjs"))
 
 
-def sha256(path):
-    digest = hashlib.sha256()
+def content_hash(path):
+    """Hash a file with line endings normalised.
+
+    git and npm disagree about newlines often enough that comparing raw bytes would
+    report a difference between a repository checkout and a published tarball that
+    are, as far as the code is concerned, identical.
+    """
     try:
         with open(path, "rb") as handle:
-            for block in iter(lambda: handle.read(65536), b""):
-                digest.update(block)
+            data = handle.read(MAX_MEMBER_BYTES)
     except OSError:
         return None
-    return digest.hexdigest()
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+
+
+def stem_of(relative_path):
+    name = relative_path.rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[0] if "." in name else name
+
+
+def suffix_of(relative_path):
+    name = relative_path.rsplit("/", 1)[-1]
+    return "." + name.rsplit(".", 1)[-1] if "." in name else ""
 
 
 def check_manifest(root):
-    """Lifecycle hooks and manifest-level facts. This is where install-time code lives."""
+    """Lifecycle hooks and manifest-level facts. This is where install-time code lives.
+
+    The manifest comes out of a hostile archive, so "valid JSON" is not the same as
+    "an object with the shape npm expects". A top-level array, or a scripts member
+    that is a list, must be reported rather than raising -- if this function throws,
+    the tool dies without emitting the JSON report it promised, and a crafted
+    package.json becomes a way to silence the audit.
+    """
     findings = []
     manifest_path = os.path.join(root, "package.json")
     raw = read_text(manifest_path)
@@ -202,7 +282,32 @@ def check_manifest(root):
         findings.append(Finding("manifest", "high", f"package.json does not parse: {error}"))
         return findings, {}
 
-    scripts = manifest.get("scripts") or {}
+    if not isinstance(manifest, dict):
+        findings.append(
+            Finding(
+                "manifest",
+                "high",
+                f"package.json is a {type(manifest).__name__}, not an object. npm would reject "
+                "this, so it is malformed on purpose or the tarball is not a package.",
+                path="package.json",
+            )
+        )
+        return findings, {}
+
+    scripts = manifest.get("scripts")
+    if scripts is not None and not isinstance(scripts, dict):
+        findings.append(
+            Finding(
+                "manifest",
+                "medium",
+                f'The "scripts" member is a {type(scripts).__name__}, not an object, so its '
+                "lifecycle hooks could not be read.",
+                path="package.json",
+            )
+        )
+        scripts = {}
+    scripts = scripts or {}
+
     for hook in INSTALL_HOOKS:
         command = scripts.get(hook)
         if not isinstance(command, str):
@@ -236,15 +341,17 @@ def check_manifest(root):
 
 
 def scan_sources(root):
-    """Static read of every source file. No execution, ever."""
+    """Static read of every source and shell file. No execution, ever."""
     findings = []
     scanned = 0
+    truncated = False
 
     for relative, full in walk_files(root):
         if scanned >= MAX_FILES_SCANNED:
+            truncated = True
             break
 
-        if relative.endswith(EXECUTABLE_SUFFIXES):
+        if relative.endswith(BINARY_SUFFIXES):
             findings.append(
                 Finding(
                     "binary_artifact",
@@ -256,12 +363,9 @@ def scan_sources(root):
             )
             continue
 
-        # Only executable source is scanned. package.json is covered by check_manifest,
-        # and running the egress and eval patterns over it just reports the homepage
-        # and bug-tracker URLs every package declares. Type declarations are skipped
-        # for the same reason: nothing in a .d.ts ever runs, so a URL in one is a
-        # documentation link, not egress.
-        if not relative.endswith(SOURCE_SUFFIXES) or relative.endswith(DECLARATION_SUFFIXES):
+        # Only executable source is scanned. package.json is the manifest check's job,
+        # and .d.ts files never run, so a URL in one is a documentation link.
+        if not relative.endswith(SCANNABLE_SUFFIXES) or relative.endswith(DECLARATION_SUFFIXES):
             continue
 
         text = read_text(full)
@@ -271,39 +375,43 @@ def scan_sources(root):
         build_path = is_build_path(relative)
         lines = text.splitlines()
 
+        def cite(line_number):
+            return lines[line_number - 1].strip() if 0 < line_number <= len(lines) else None
+
         for check, pattern in PATTERNS.items():
             # Minified bundles legitimately contain eval-ish and encoded content, so
             # inside a build directory only the unambiguous checks still apply.
             if build_path and check in {"long_encoded_literal", "dynamic_eval", "char_code_assembly"}:
                 continue
-
-            # Reading one or two environment variables is what every library does to
-            # find NODE_ENV. Only a file pulling several distinct values is doing
-            # something that looks like collection.
-            if check == "env_harvest" and len(set(pattern.findall(text))) < 3:
-                continue
-
             match = pattern.search(text)
             if not match:
                 continue
             line_number = text.count("\n", 0, match.start()) + 1
-            severity = {
-                "pipe_to_shell": "critical",
-                "process_execution": "high",
-                "raw_socket": "high",
-                "dynamic_eval": "medium",
-                "long_encoded_literal": "medium",
-                "char_code_assembly": "medium",
-                "env_harvest": "low",
-            }[check]
             findings.append(
                 Finding(
                     check,
-                    severity,
+                    SEVERITY_BY_CHECK[check],
                     f"Matched the {check.replace('_', ' ')} pattern.",
                     path=relative,
                     line=line_number,
-                    evidence=lines[line_number - 1].strip() if line_number <= len(lines) else None,
+                    evidence=cite(line_number),
+                )
+            )
+
+        # Reading one or two environment variables is what every library does to find
+        # NODE_ENV. Several distinct values is collection.
+        env_names = {name or bracketed for name, bracketed in ENV_ACCESS.findall(text)}
+        if len(env_names) >= ENV_DISTINCT_THRESHOLD:
+            match = ENV_ACCESS.search(text)
+            line_number = text.count("\n", 0, match.start()) + 1 if match else None
+            findings.append(
+                Finding(
+                    "env_harvest",
+                    "low",
+                    f"Reads {len(env_names)} distinct environment variables.",
+                    path=relative,
+                    line=line_number,
+                    evidence=", ".join(sorted(env_names)[:10]),
                 )
             )
 
@@ -332,7 +440,7 @@ def scan_sources(root):
                 )
             )
 
-    return findings, scanned
+    return findings, {"files_scanned": scanned, "scan_truncated": truncated}
 
 
 def repo_slug(repo_url):
@@ -368,86 +476,149 @@ def fetch_repo_tree(repo_url, version):
     )
 
 
+def index_repository(repo_root):
+    """Index the repository by path and by basename, with content hashes."""
+    by_path = {}
+    by_stem = {}
+    is_built = False
+
+    for relative, full in walk_files(repo_root):
+        by_path[relative] = content_hash(full)
+        by_stem.setdefault(stem_of(relative), []).append(relative)
+        if relative.rsplit("/", 1)[-1] in BUILD_CONFIG_FILES:
+            is_built = True
+        if relative.endswith(COMPILABLE_SUFFIXES):
+            is_built = True
+
+    return by_path, by_stem, is_built
+
+
 def compare_with_source(npm_root, repo_bytes):
-    """Files that exist in the published tarball but not in the reviewed repository.
+    """Compare what ships against what was reviewed.
 
-    This is the check that matters most. The repository is what humans read; the
-    tarball is what actually runs on their machines. Anything present only in the
-    tarball was reviewed by nobody.
+    The repository is what humans read; the tarball is what actually runs on their
+    machines. Two things can go wrong, and both are reported:
 
-    Build output legitimately exists only in the tarball, so those paths are
-    reported as information rather than as findings.
+      - a file that ships and has no counterpart in the repository at all
+      - a file that ships at a path the repository also has, but with different
+        contents
+
+    The second is the one that is easy to miss. Indexing the repository and then
+    only checking for the *presence* of a path would clear a modified index.js
+    without ever looking at it, which is precisely the substitution an attacker
+    would make.
+
+    Where a file cannot be matched exactly, a counterpart is accepted only when it
+    is unambiguous -- exactly one candidate. A basename shared by several files
+    establishes nothing, and clearing a finding on that basis would let an injected
+    index.js hide behind an unrelated index.ts.
     """
     findings = []
     with tempfile.TemporaryDirectory() as workspace:
         safe_extract(repo_bytes, workspace)
         repo_root = package_root(workspace)
+        by_path, by_stem, repo_is_built = index_repository(repo_root)
 
-        repo_files = {}
-        repo_stems = set()
-        repo_is_built = False
-        for relative, full in walk_files(repo_root):
-            repo_files[relative] = sha256(full)
-            if relative.rsplit("/", 1)[-1] in BUILD_CONFIG_FILES:
-                repo_is_built = True
-            if relative.endswith(COMPILABLE_SUFFIXES):
-                repo_is_built = True
-                # A published foo.js compiled from a reviewed foo.ts is build output,
-                # not unreviewed code. Match on basename rather than full path: the
-                # npm package is often assembled from a subdirectory of the repo, so
-                # a tarball's install.js can correspond to npm/pkg/install.ts and the
-                # paths will never line up.
-                repo_stems.add(relative.rsplit(".", 1)[0].rsplit("/", 1)[-1])
+        relocated = 0
+        compiled_counterpart = 0
 
-        # Match on basename-and-suffix as well as exact path: npm tarballs often flatten
-        # a `src/` prefix away, and treating that as "missing from the repo" would be
-        # a false positive on nearly every package.
-        repo_tails = {r.split("/", 1)[-1] for r in repo_files}
+        def severity_for_missing(relative):
+            # A plain-JavaScript package should mirror its repository, so an unmatched
+            # file is close to damning. A project that compiles can rename on the way
+            # out -- esbuild publishes lib/npm/node-install.ts as install.js -- and no
+            # name-based rule tells that apart from a smuggled file. Build directories
+            # are the likeliest place for legitimate generated code, so they are
+            # quieter still. None of these are silent: a build directory is a naming
+            # convention, not provenance, and dist/index.js is often the entry point.
+            if not repo_is_built:
+                return "medium" if is_build_path(relative) else "critical"
+            return "low" if is_build_path(relative) else "medium"
 
-        build_only = 0
-        compiled_from_source = 0
         for relative, full in walk_files(npm_root):
-            if not relative.endswith(SOURCE_SUFFIXES):
+            if not relative.endswith(SOURCE_SUFFIXES) or relative.endswith(DECLARATION_SUFFIXES):
                 continue
-            tail = relative.split("/", 1)[-1]
-            if relative in repo_files or tail in repo_tails or relative in repo_tails:
+
+            published = content_hash(full)
+
+            if relative in by_path:
+                if by_path[relative] == published:
+                    continue
+                findings.append(
+                    Finding(
+                        "tarball_source_differs",
+                        "medium" if repo_is_built else "high",
+                        "This file ships at the same path as one in the repository, but the "
+                        "contents are not the same. Read both before accepting it."
+                        + (
+                            " The project has a build step, so a generated file may legitimately "
+                            "differ from its checked-in form."
+                            if repo_is_built
+                            else " The project has no build step, so there is no ordinary reason "
+                            "for the published copy to differ."
+                        ),
+                        path=relative,
+                    )
+                )
                 continue
-            if is_build_path(relative):
-                build_only += 1
+
+            candidates = by_stem.get(stem_of(relative), [])
+            suffix = suffix_of(relative)
+            same_kind = [c for c in candidates if suffix_of(c) == suffix]
+
+            # Exactly one file of the same kind and name elsewhere in the tree: a
+            # flattened publish layout. Content still has to agree.
+            if len(same_kind) == 1:
+                if by_path[same_kind[0]] == published:
+                    relocated += 1
+                    continue
+                findings.append(
+                    Finding(
+                        "tarball_source_differs",
+                        "medium" if repo_is_built else "high",
+                        f"Published as {relative}, which appears to correspond to "
+                        f"{same_kind[0]} in the repository, but the contents differ.",
+                        path=relative,
+                    )
+                )
                 continue
-            if relative.rsplit(".", 1)[0].rsplit("/", 1)[-1] in repo_stems:
-                compiled_from_source += 1
+
+            compilable = [c for c in candidates if c.endswith(COMPILABLE_SUFFIXES)]
+            if repo_is_built and len(compilable) == 1:
+                # Compiled output never matches its source byte for byte, so this
+                # cannot be verified -- only noted, and at the lowest severity.
+                compiled_counterpart += 1
+                findings.append(
+                    Finding(
+                        "tarball_only_source",
+                        "low",
+                        f"Not present in the repository, but {compilable[0]} is a plausible "
+                        "source for it. Compiled output cannot be verified by content, so this "
+                        "correspondence is assumed from the name alone.",
+                        path=relative,
+                    )
+                )
                 continue
-            # How much this finding is worth depends on whether the project compiles.
-            # In a plain-JavaScript package the tarball should mirror the repository,
-            # so a file present in one and not the other is close to damning. A project
-            # that builds can legitimately rename as it publishes -- esbuild ships
-            # lib/npm/node-install.ts as install.js -- and no name-based rule can tell
-            # that apart from a smuggled file. So it is reported either way, but only
-            # claimed as critical where the claim actually holds.
+
             findings.append(
                 Finding(
                     "tarball_only_source",
-                    "medium" if repo_is_built else "critical",
-                    "This source file is published in the npm tarball but has no counterpart "
-                    "in the linked repository at this version. Code that ships only in the "
-                    "tarball has been reviewed by nobody."
+                    severity_for_missing(relative),
+                    "This file is published in the npm tarball but has no counterpart in the "
+                    "linked repository at this version. Code that ships only in the tarball "
+                    "has been reviewed by nobody."
                     + (
-                        " The repository has a build step, so the file may simply have been "
-                        "renamed during compilation. Read it and find its source before "
-                        "treating this as an attack."
-                        if repo_is_built
-                        else " The repository has no build step, so the tarball should mirror "
-                        "it. There is no ordinary reason for this file to exist."
+                        " It sits under a build directory, where generated code is expected."
+                        if is_build_path(relative)
+                        else ""
                     ),
                     path=relative,
                 )
             )
 
         return findings, {
-            "repo_files": len(repo_files),
-            "build_only_files": build_only,
-            "compiled_from_source_files": compiled_from_source,
+            "repo_files": len(by_path),
+            "relocated_files": relocated,
+            "compiled_from_source_files": compiled_counterpart,
             "repo_has_build_step": repo_is_built,
         }
 
@@ -489,21 +660,37 @@ def main():
 
     with tempfile.TemporaryDirectory() as workspace:
         try:
-            extracted = safe_extract(tarball, workspace)
+            extraction = safe_extract(tarball, workspace)
         except Exception as error:  # noqa: BLE001
             report["error"] = f"Could not unpack the tarball: {error}"
             print(json.dumps(report, indent=2))
             return 1
 
         root = package_root(workspace)
-        report["stats"]["files_extracted"] = extracted
+        report["stats"]["files_extracted"] = extraction["files"]
+        report["stats"]["unpacked_bytes"] = extraction["bytes"]
+        if extraction["truncated"]:
+            report["limitations"].append(extraction["truncated"])
 
-        manifest_findings, _manifest = check_manifest(root)
-        report["findings"].extend(manifest_findings)
+        # Every stage is guarded. The archive is hostile by assumption, and a report
+        # that says what could not be checked is worth more than a traceback.
+        try:
+            manifest_findings, _manifest = check_manifest(root)
+            report["findings"].extend(manifest_findings)
+        except Exception as error:  # noqa: BLE001
+            report["limitations"].append(f"Manifest inspection failed: {error}")
 
-        source_findings, scanned = scan_sources(root)
-        report["findings"].extend(source_findings)
-        report["stats"]["files_scanned"] = scanned
+        try:
+            source_findings, scan_stats = scan_sources(root)
+            report["findings"].extend(source_findings)
+            report["stats"].update(scan_stats)
+            if scan_stats["scan_truncated"]:
+                report["limitations"].append(
+                    f"Only the first {MAX_FILES_SCANNED} source files were scanned; the rest of "
+                    "the package was not read. This report is not a complete pass."
+                )
+        except Exception as error:  # noqa: BLE001
+            report["limitations"].append(f"Source scan failed: {error}")
 
         repo_bytes, reason = fetch_repo_tree(args.repo_url, args.version)
         if repo_bytes is None:
@@ -517,9 +704,7 @@ def main():
             except Exception as error:  # noqa: BLE001
                 report["limitations"].append(f"Source comparison failed: {error}")
 
-    if "compared_against_source" not in report["stats"]:
-        report["stats"]["compared_against_source"] = False
-
+    report["stats"].setdefault("compared_against_source", False)
     report["summary"] = summarise(report["findings"])
     print(json.dumps(report, indent=2))
     return 0
