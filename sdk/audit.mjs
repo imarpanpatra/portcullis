@@ -10,9 +10,15 @@
 // client that ignores either simply never gets a result -- the gate lives in the
 // harness, not in the politeness of the client.
 //
+// A turn also runs on the server rather than in this process, so a dropped stream
+// is reattached to rather than restarted, and a session can be rejoined later --
+// or by a second client while the first is still working.
+//
 //   node audit.mjs express
+//   node audit.mjs express chalk ms          (one subagent per package, in parallel)
 //   node audit.mjs left-pad --repo imarpanpatra/portcullis-demo
-//   node audit.mjs lodash --deny        (refuse the write without being asked)
+//   node audit.mjs lodash --deny             (refuse the write without being asked)
+//   node audit.mjs axios --session <id>      (rejoin a session, or a running turn)
 
 import readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
@@ -94,7 +100,15 @@ function closePrompt() {
  */
 const MAX_RECONNECTS = 3;
 
-async function runTurn(sessionId, input) {
+/**
+ * Run a turn and follow it to the end.
+ *
+ * With `input`, a new turn is created. With `attachTo`, an existing turn already
+ * running on the server is joined instead -- which is what resuming a session has
+ * to do, because asking the question again would start a second audit alongside
+ * the first.
+ */
+async function runTurn(sessionId, { input = null, attachTo = null } = {}) {
   const events = new Map();
   const pendingApprovals = [];
   const pendingQuestions = [];
@@ -148,19 +162,38 @@ async function runTurn(sessionId, input) {
     }
   };
 
-  await consume(await client.sessions.createTurnStream(sessionId, { input }));
+  // The first stream has to be guarded too. Letting an error escape here would
+  // skip the reconnect loop entirely -- and a dropped connection is precisely the
+  // case the loop exists for, so the one failure it was written to survive would
+  // have been the one that got past it.
+  try {
+    if (attachTo) {
+      turnId = attachTo;
+      await consume(await client.sessions.subscribeToTurn(sessionId, attachTo));
+    } else {
+      await consume(await client.sessions.createTurnStream(sessionId, { input }));
+    }
+  } catch (error) {
+    console.log(`\n  [stream failed: ${error?.message ?? error}]`);
+  }
 
   // The turn runs on the server, not in this process. If the stream drops, the
   // work carries on without us, so the right response is to attach to it again
   // rather than to start over -- restarting would re-run tool calls that already
   // happened. subscribeToTurn picks the same turn back up.
   for (let attempt = 1; !done && turnId && attempt <= MAX_RECONNECTS; attempt += 1) {
-    console.log(`\n  [stream ended before the turn finished; reattaching (${attempt})]`);
+    console.log(`\n  [turn did not finish on this stream; reattaching (${attempt}/${MAX_RECONNECTS})]`);
     try {
       await consume(await client.sessions.subscribeToTurn(sessionId, turnId));
     } catch (error) {
       console.log(`  [reattach failed: ${error?.message ?? error}]`);
     }
+  }
+
+  if (!done && turnId) {
+    console.log(
+      `\n  [gave up reattaching. The turn is still on the server; rejoin it with --session ${sessionId}]`,
+    );
   }
 
   if (threads.size) console.log(`\n  (${threads.size} subagent(s) ran in this turn)`);
@@ -289,34 +322,61 @@ function buildQuestion() {
 async function openSession() {
   if (!args.session) {
     const { data: created } = await client.sessions.create({ agent: { name: AGENT_NAME } });
-    return created;
+    return { session: created, running: null };
   }
 
   const { data } = await client.sessions.get(args.session);
   const existing = data?.id ? data : (data?.data ?? { id: args.session });
 
-  let earlier = 0;
-  for await (const _turn of await client.sessions.listTurns(existing.id)) earlier += 1;
-  console.log(`\nresuming session ${existing.id} — ${earlier} earlier turn(s) already in it`);
-  return existing;
+  const turns = [];
+  for await (const turn of await client.sessions.listTurns(existing.id)) turns.push(turn);
+
+  // A session can be resumed while a turn is still going. Submitting the question
+  // again in that state would run a *second* audit beside the first -- repeating
+  // tool calls, and for an agent that opens pull requests, potentially producing a
+  // second branch and a second PR from one approval. Recovery means rejoining the
+  // turn that is already running, not starting another one.
+  const last = turns[turns.length - 1];
+  const running = last?.state?.status === "running" ? last : null;
+
+  console.log(`\nresuming session ${existing.id} — ${turns.length} earlier turn(s) already in it`);
+  if (running) {
+    console.log(`  a turn is still running (${running.id}); rejoining it rather than asking again`);
+  }
+  return { session: existing, running };
 }
 
 async function main() {
   const question = buildQuestion();
-  const session = await openSession();
+  const { session, running } = await openSession();
 
   const label = args.packages.length > 1 ? "packages" : "package";
   rule(`session ${session.id}  |  agent ${AGENT_NAME}  |  ${label} ${args.packages.join(", ")}`);
   console.log(`continue this session later:  node audit.mjs <package> --session ${session.id}\n`);
 
-  let input = [{ type: "user.message", content: question }];
+  // Rejoining an in-flight turn means observing the work already under way, so the
+  // question is not asked again. It is asked only once that turn has finished.
+  let attachTo = running?.id ?? null;
+  let input = attachTo ? null : [{ type: "user.message", content: question }];
 
-  // Every pause ends a turn, so resuming means opening a new one. This runs until
-  // the agent finishes a turn without asking for anything.
+  // Every pause ends a turn, so continuing means opening a new one. This runs until
+  // the agent finishes a turn without asking for anything. A rejoined turn is
+  // observed first; the question only goes in once that turn has come to rest.
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
-    const { events, pendingApprovals, pendingQuestions } = await runTurn(session.id, input);
+    const { events, pendingApprovals, pendingQuestions } = await runTurn(session.id, {
+      input,
+      attachTo,
+    });
 
     if (pendingApprovals.length === 0 && pendingQuestions.length === 0) {
+      // A rejoined turn finishing without a pause means the work we came back for
+      // is done. Ask the question now, in a turn of its own, rather than treating
+      // the run as over.
+      if (attachTo) {
+        attachTo = null;
+        input = [{ type: "user.message", content: question }];
+        continue;
+      }
       closePrompt();
       rule("done");
       return;
@@ -348,6 +408,7 @@ async function main() {
     }
 
     input = next;
+    attachTo = null;
   }
 
   closePrompt();
