@@ -198,7 +198,12 @@ async function runTurn(sessionId, { input = null, attachTo = null } = {}) {
 
   if (threads.size) console.log(`\n  (${threads.size} subagent(s) ran in this turn)`);
 
-  return { events, pendingApprovals, pendingQuestions };
+  // `completed` says whether turn.done was actually seen. Without it the caller
+  // cannot tell "the agent finished and asked for nothing" apart from "we never
+  // heard back", and those need opposite responses. Treating the second as the
+  // first is how an unreachable server becomes a successful-looking audit that
+  // never ran, or how a second audit gets started beside one still going.
+  return { events, pendingApprovals, pendingQuestions, completed: done };
 }
 
 /** Resolve a pending event's refs into the concrete calls they point at. */
@@ -336,8 +341,11 @@ async function openSession() {
   // tool calls, and for an agent that opens pull requests, potentially producing a
   // second branch and a second PR from one approval. Recovery means rejoining the
   // turn that is already running, not starting another one.
-  const last = turns[turns.length - 1];
-  const running = last?.state?.status === "running" ? last : null;
+  //
+  // Found by scanning rather than by taking the last element. Only one turn runs in
+  // a session at a time, so the running one is unambiguous wherever it sits, and
+  // this cannot be broken by an ordering assumption being wrong.
+  const running = turns.find((turn) => turn.state?.status === "running") ?? null;
 
   console.log(`\nresuming session ${existing.id} — ${turns.length} earlier turn(s) already in it`);
   if (running) {
@@ -363,10 +371,22 @@ async function main() {
   // the agent finishes a turn without asking for anything. A rejoined turn is
   // observed first; the question only goes in once that turn has come to rest.
   for (let round = 0; round < MAX_ROUNDS; round += 1) {
-    const { events, pendingApprovals, pendingQuestions } = await runTurn(session.id, {
+    const { events, pendingApprovals, pendingQuestions, completed } = await runTurn(session.id, {
       input,
       attachTo,
     });
+
+    // Never carry on from a turn we lost track of. It may still be running on the
+    // server, so asking the question again would put a second audit beside it, and
+    // reporting success would claim an audit that may never have happened.
+    if (!completed) {
+      closePrompt();
+      rule("could not follow this turn to the end");
+      console.log("The turn may still be running on the server. Nothing further was submitted.");
+      console.log(`Rejoin it with:  node audit.mjs ${args.packages[0]} --session ${session.id}`);
+      process.exitCode = 1;
+      return;
+    }
 
     if (pendingApprovals.length === 0 && pendingQuestions.length === 0) {
       // A rejoined turn finishing without a pause means the work we came back for
