@@ -71,6 +71,33 @@ So a judge running this does not have to know which provider you happened to use
 Agent definitions never contain API keys — the model is referenced by name and the
 credentials stay in the harness.
 
+## Two kinds of pause
+
+`config.ask_user_questions` is enabled alongside the approval gate, and the runner
+handles both. They are different stops:
+
+| Event | Means | Resumed with |
+| --- | --- | --- |
+| `tool.approval_required` | The agent wants to make an irreversible write | `user.tool_approval` |
+| `tool.response_required` | The agent is asking something it should not guess | `user.tool_response` |
+
+Both end the turn. A client that collects only approvals looks fine until the first
+audit that needs a question answered, at which point the turn ends, nothing is
+pending as far as the client knows, and the session exits with no verdict. That
+matters here more than it might elsewhere, because the skill instructs the agent to
+ask *"did you mean express?"* the moment a name looks like a typosquat — the most
+common path through this agent is the one that asks.
+
+## There is no --yes flag
+
+`audit.mjs` deliberately has no unattended-approval flag. The claim this project
+makes is that a person sees the concrete write before it happens; a flag that
+pre-approves every gated call defeats that, and it would be the first thing anyone
+reached for in CI, which is precisely where nobody is watching.
+
+`--deny` stays, because refusing without being asked can only ever result in less
+happening than the operator intended, never more.
+
 ## Instructions versus skill
 
 The instructions say what this agent *is* and what it must never do. The procedure
