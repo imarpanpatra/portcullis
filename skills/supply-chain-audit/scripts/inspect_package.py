@@ -711,28 +711,32 @@ def summarise(findings):
     return {"counts": counts, "highest_severity": highest, "total": len(findings)}
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Inspect a published npm tarball.")
-    parser.add_argument("--name", required=True)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--tarball", required=True, help="Tarball URL from get_package_metadata.")
-    parser.add_argument("--repo-url", default=None, help="Linked source repository, if any.")
-    args = parser.parse_args()
+def audit(name, version, tarball_url, repo_url=None):
+    """Inspect one published package and return the report as a dict.
 
+    This is the entry point Code Mode uses. The agent imports this module inside
+    the sandbox and calls this function directly, rather than shelling out to the
+    script -- the sandbox image cannot be relied on to have bash, and a tool that
+    needs a particular shell to exist is a tool that stops working on somebody
+    else's image. Python is the one thing the sandbox is guaranteed to have,
+    because the harness already runs its own client there.
+
+    Never raises for an audit failure: a report saying what could not be checked
+    is worth more to the agent than an exception it has to interpret.
+    """
     report = {
-        "package": args.name,
-        "version": args.version,
+        "package": name,
+        "version": version,
         "findings": [],
         "limitations": [],
         "stats": {},
     }
 
     try:
-        tarball = fetch(args.tarball)
+        tarball = fetch(tarball_url)
     except Exception as error:  # noqa: BLE001 - the agent needs the reason, not a traceback
         report["error"] = f"Could not download the tarball: {error}"
-        print(json.dumps(report, indent=2))
-        return 1
+        return report
 
     report["stats"]["tarball_bytes"] = len(tarball)
 
@@ -741,8 +745,7 @@ def main():
             extraction = safe_extract(tarball, workspace)
         except Exception as error:  # noqa: BLE001
             report["error"] = f"Could not unpack the tarball: {error}"
-            print(json.dumps(report, indent=2))
-            return 1
+            return report
 
         root = package_root(workspace)
         report["stats"]["files_extracted"] = extraction["files"]
@@ -770,7 +773,7 @@ def main():
         except Exception as error:  # noqa: BLE001
             report["limitations"].append(f"Source scan failed: {error}")
 
-        repo_bytes, reason = fetch_repo_tree(args.repo_url, args.version)
+        repo_bytes, reason = fetch_repo_tree(repo_url, version)
         if repo_bytes is None:
             report["limitations"].append(reason)
         else:
@@ -790,8 +793,21 @@ def main():
 
     report["stats"].setdefault("compared_against_source", False)
     report["summary"] = summarise(report["findings"])
+    return report
+
+
+def main():
+    """Command-line wrapper. Kept so the inspector can be run and tested directly."""
+    parser = argparse.ArgumentParser(description="Inspect a published npm tarball.")
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--tarball", required=True, help="Tarball URL from get_package_metadata.")
+    parser.add_argument("--repo-url", default=None, help="Linked source repository, if any.")
+    args = parser.parse_args()
+
+    report = audit(args.name, args.version, args.tarball, args.repo_url)
     print(json.dumps(report, indent=2))
-    return 0
+    return 1 if report.get("error") else 0
 
 
 if __name__ == "__main__":

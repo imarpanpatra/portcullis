@@ -57,16 +57,31 @@ None of these condemn a package by themselves. They tell you how hard to look ne
 
 This is the step nobody does by hand, and the reason you have a sandbox.
 
-Run the bundled inspector. It downloads the published tarball, unpacks it safely,
-and reports what is inside — it never executes the package:
+Run the bundled inspector **using Code Mode**, importing it rather than shelling
+out. Do not use a shell command for this: the sandbox image is not guaranteed to
+have `bash`, and a step that depends on one silently fails on some images. Python
+is always present, because the harness runs its own client there.
 
-```bash
-python3 /opt/tfy/skills/supply-chain-audit/scripts/inspect_package.py \
-  --name <package> --version <version> \
-  --tarball <tarball-url> --repo-url <repository-url>
+```python
+import sys, json
+sys.path.insert(0, "/opt/tf/skills/supply-chain-audit/scripts")
+from inspect_package import audit
+
+report = audit(
+    name="<package>",
+    version="<version>",
+    tarball_url="<tarball url from get_package_metadata>",
+    repo_url="<repository_url from get_package_metadata, or None>",
+)
+print(json.dumps(report, indent=2))
 ```
 
-It emits JSON findings. Read them carefully; the checks that matter most are:
+It downloads the published tarball, unpacks it safely, and reports what is inside.
+**It never executes the package.** It returns a dict rather than raising, so if
+something could not be checked you get a `limitations` entry to report rather than
+an error to work around.
+
+Read the findings carefully; the checks that matter most are:
 
 - **`install_script`** — a `preinstall`, `install`, or `postinstall` hook. This code
   runs on every machine that installs the package, including CI, before anyone has
