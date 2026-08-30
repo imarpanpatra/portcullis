@@ -121,13 +121,18 @@ Commit to one of three, and say which:
   `--ignore-scripts`, or prefer a named alternative. State the condition.
 - **Refuse** — say exactly which finding drives the refusal. One sentence.
 
-### Render the report the same way every time
+### Render the report as Generative UI
 
-The person reading this has to see three things at a glance: what you decided, what
-you looked at, and what you could not check. Use the same shape every run, so a
-reader learns it once.
+**Emit the report inside an `openui` fenced block, not as markdown tables.** The chat
+UI renders that block as real components -- cards, tables, callouts -- and a markdown
+table is a flat wall of pipes by comparison. This is the part of the answer the
+reader actually looks at, so it is worth the few extra tokens.
 
-```
+The person reading has to see three things at a glance: what you decided, what you
+looked at, and what you could not check. Use the same shape every run, so a reader
+learns it once. Fill in the values; keep the structure.
+
+```openui
 root = Stack([verdict, signals, findings, gaps], "column", "m")
 
 verdict = Callout(<tone>, "<Verdict>: <package>@<version>", "<one sentence, the reason>")
@@ -137,7 +142,7 @@ verdict = Callout(<tone>, "<Verdict>: <package>@<version>", "<one sentence, the 
 refuse. The title carries the decision and the exact version it applies to -- a
 verdict without a version is not a verdict.
 
-```
+```openui
 signals = Card([CardHeader("What I looked at", "Registry and tarball"), signalsTable])
 signalsTable = Table([Col("Signal", names), Col("Value", values), Col("Source", sources)])
 ```
@@ -147,7 +152,7 @@ the tarball inspection (files scanned, whether the source comparison ran). The
 `Source` column names the tool the number came from, so every figure on screen can
 be traced back.
 
-```
+```openui
 findings = Card([CardHeader("Findings", "<n> kept, <m> dropped as false positives"), findingsTable])
 findingsTable = Table([Col("Severity", ...), Col("Finding", ...), Col("File", ...), Col("Disposition", ...)])
 ```
@@ -157,7 +162,7 @@ cannot tell a careful audit from a shallow one, and the dropped rows are the
 evidence that you checked rather than repeated. If nothing was found at all, say so
 in one row rather than hiding the table.
 
-```
+```openui
 gaps = Card([CardHeader("What I could not check", "..."), TextContent(...)])
 ```
 
@@ -168,7 +173,14 @@ When several packages were audited, lead with one `Table` of package, version an
 verdict, then a `Card` per package underneath in the same shape as above.
 
 Keep the prose outside the block short. The card is the report; the text around it
-should not repeat it.
+should not repeat it -- one line naming the verdict is enough, since the callout
+already carries it.
+
+Available components: `Stack`, `Card`, `CardHeader`, `Table`, `Col`, `Callout`,
+`TextContent`, `CodeBlock`, `MarkDownRenderer`, `List`, `Progress`, `Accordion`,
+`Tabs`, `BarChart`, `LineChart`, `PieChart`, `Link`, `Image`, `Button`. Prefer the
+plain ones above; reach for a chart only when there is genuinely a distribution
+worth seeing, which for a single package there usually is not.
 
 ## Auditing several packages at once
 
