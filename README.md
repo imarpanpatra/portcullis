@@ -204,7 +204,17 @@ node audit.mjs left-pad --repo you/demo --deny   # the gate fires and is refused
 
 ## Qodo Code Review Evidence
 
-Every substantive change went through a pull request reviewed by [Qodo](https://qodo.ai) before merge. Across five pull requests Qodo raised **23 findings**. All 23 were assessed and answered individually in-thread; **22 were valid and fixed**, and one was disputed with the reason recorded.
+Every substantive change went through a pull request reviewed by [Qodo](https://qodo.ai) before merge. Across eight pull requests Qodo raised **33 findings** — 22 High, 11 Medium. All 33 were assessed and answered individually in-thread; **30 were valid and fixed**, and 3 were disputed with the reason recorded.
+
+| PR | Findings | | Outcome |
+| --- | --- | --- | --- |
+| [#2](https://github.com/imarpanpatra/portcullis/pull/2) the audit skill and inspector | 16 | 11H 5M | 4 review rounds |
+| [#3](https://github.com/imarpanpatra/portcullis/pull/3) agent spec and SDK runner | 4 | 2H 2M | 1 partly disputed |
+| [#4](https://github.com/imarpanpatra/portcullis/pull/4) README and demo script | 1 | 1H | disputed — branch ordering |
+| [#5](https://github.com/imarpanpatra/portcullis/pull/5) what first contact broke | 4 | 2H 2M | all fixed |
+| [#6](https://github.com/imarpanpatra/portcullis/pull/6) fan-out and sessions | 5 | 5H | all fixed |
+| [#7](https://github.com/imarpanpatra/portcullis/pull/7) Generative UI report | 3 | 1H 2M | 1 disputed with evidence |
+| [#8](https://github.com/imarpanpatra/portcullis/pull/8) demo video link | 0 | — | clean |
 
 **Representative merged PR: [#2 - Add the supply-chain audit skill and sandbox inspector](https://github.com/imarpanpatra/portcullis/pull/2)** (16 findings over four review rounds)
 
@@ -217,11 +227,11 @@ The findings that mattered most, all in the inspector:
 
 **The review found defects that my own fixes introduced.** The extraction caps added in round one let a truncated repository tree manufacture false critical findings. Capping every finding in response then went too far the other way and understated a *proven* content mismatch. Teaching the scanner to read `.sh` files without extending the provenance check left shell scripts half-examined. Three of the four rounds on #2 were corrections to earlier corrections, which is the honest argument for why the review mattered: a single clean pass would have found none of them.
 
-**The one I disputed:** on [#3](https://github.com/imarpanpatra/portcullis/pull/3) and [#4](https://github.com/imarpanpatra/portcullis/pull/4) Qodo reported the audit skill and the runner as missing. Both were artefacts of branch ordering rather than defects, and I said so in-thread rather than manufacturing a change. The *substantive* half of the #3 finding was real and fixed: the runner referenced the skill without ever registering it, so a fresh server would have produced an agent that could not load its own procedure.
+**The ones I disputed:** on [#3](https://github.com/imarpanpatra/portcullis/pull/3) and [#4](https://github.com/imarpanpatra/portcullis/pull/4) Qodo reported the audit skill and the runner as missing. Both were artefacts of branch ordering rather than defects, and I said so in-thread rather than manufacturing a change. The *substantive* half of the #3 finding was real and fixed: the runner referenced the skill without ever registering it, so a fresh server would have produced an agent that could not load its own procedure.
 
 **[#5](https://github.com/imarpanpatra/portcullis/pull/5)** carries everything that only first contact with a live sandbox could reveal, plus two findings that arrived on #2 and #3 after they had merged.
 
-Trail: 23 findings, 23 replies, fix commits against each round, and follow-up reviews run against the final code on every pull request.
+Trail: 33 findings, 33 replies, fix commits against each round, and follow-up reviews run against the final code on every pull request. Nothing was left unanswered.
 
 ## What running it for real changed
 
