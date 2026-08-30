@@ -32,6 +32,8 @@ A chat window could describe supply-chain risk in the abstract. It could not do 
 | Execute untrusted third-party code safely | Sandbox-as-tool. The tarball is unpacked and read in an isolated sandbox while model and connector credentials stay in the harness |
 | Refuse to act alone on an irreversible write | `require_approval_for_tools` ends the turn before a gated call and will not resume without a `user.tool_approval` event |
 | Ask rather than guess | `ask_user_question` — used the moment a package name looks like a typo |
+| Audit several packages at once | Subagents — one per package, run in parallel, results merged into one ranked report |
+| Survive the client going away | Sessions hold context server-side, and a dropped stream reattaches to the same turn rather than restarting it |
 
 Take the harness away and the project stops being possible, not merely less convenient.
 
@@ -39,18 +41,28 @@ Take the harness away and the project stops being possible, not merely less conv
 
 ```
         you ──────────────────────────────► sdk/audit.mjs
-                                                  │
+                                                  │            session id ──► resume later
                                       TrueForge harness (agent loop)
-                                       │           │            │
-                     ┌─────────────────┘           │            └──────────────┐
-                     ▼                             ▼                           ▼
-            portcullis MCP                  Daytona sandbox              github MCP
-          (mcp/, read-only)          (skills/supply-chain-audit)        (catalog, GATED)
-                     │                             │                           │
-       registry · downloads · OSV      unpack tarball, read code,        branch · commit
-                                        diff against GitHub source        · pull request
-                                                                                │
-                                                                    ⏸ pauses for approval
+                                                  │
+                              one subagent per package, in parallel
+                             ┌────────────────────┼────────────────────┐
+                             ▼                    ▼                    ▼
+                        audit-express         audit-chalk          audit-ms
+                             │                    │                    │
+                     ┌───────┴──────┐             │                    │
+                     ▼              ▼             ▼                    ▼
+            portcullis MCP    Daytona sandbox                  ... same tools ...
+          (mcp/, read-only)  (skills/supply-chain-audit)
+                     │              │
+       registry · downloads · OSV   unpack tarball, read code,
+                                    diff against GitHub source
+                             merged, ranked, one verdict per package
+                                                  │
+                                                  ▼
+                                            github MCP  (catalog, GATED)
+                                       branch · commit · pull request
+                                                  │
+                                      ⏸ pauses for human approval
 ```
 
 | Directory | What it is |
@@ -95,10 +107,23 @@ Other environment variables: `TRUEFORGE_BASE_URL`, `PORTCULLIS_MCP_URL`, `PORTCU
 ## Running an audit
 
 ```bash
-node audit.mjs express                                  # audit only
+node audit.mjs express                                  # audit one package
+node audit.mjs express chalk ms left-pad                # audit several, one subagent each
 node audit.mjs left-pad --repo you/your-demo-repo       # audit, then offer to open a PR
 node audit.mjs lodash  --repo you/your-demo-repo --deny # refuse the write and watch it stop
+node audit.mjs axios   --session <id>                   # continue an earlier session
 ```
+
+Given more than one package the agent **fans out**, giving each its own subagent and
+merging the results into a single ranked report with a verdict per package. The audits
+are independent, so nothing is gained by making the reviewer wait on the slowest
+tarball, and each packument stays out of the main context.
+
+Every run prints its session id. Sessions keep their context on the server, so
+`--session` resumes one that already knows what was audited and decided earlier. If
+the stream drops mid-turn the runner **reattaches to the same turn** rather than
+starting over — the work is running on the server, and re-running tool calls that
+already happened is the wrong kind of retry for an agent that writes to repositories.
 
 There is deliberately **no `--yes`**. A flag that pre-approves every gated write defeats the only claim this project makes, and it would be the first thing anyone reached for in CI — which is exactly where nobody is watching.
 
@@ -118,14 +143,50 @@ That last row is the one worth defending. The tool's job is to be right, not ala
 
 Audited `left-pad`, raised two `network_egress` candidates, verified both against the shipped files and dropped them as WTFPL licence-comment URLs, set its own condition (pin exactly `1.3.0`, not a caret range), paused three times - `create_branch`, `create_or_update_file`, `create_pull_request` - and on approval opened [portcullis-demo#1](https://github.com/imarpanpatra/portcullis-demo/pull/1) honouring that condition in the diff. Run with `--deny`, it acknowledges the refusal and stops rather than looking for another route.
 
-## Tests
+## Testing
+
+Three layers, cheapest first. The first two need nothing but a clone.
+
+**1. The inspector, offline (57 tests, no network):**
 
 ```bash
-node mcp/smoke.mjs                                              # 18 assertions, live APIs
-python3 -m unittest discover -s skills/supply-chain-audit/tests # 50 tests, fully offline
+python3 -m unittest discover -s skills/supply-chain-audit/tests -v
 ```
 
-The offline suite builds every fixture in memory — nothing malicious is downloaded — and includes cases that attack the inspector itself with path traversal, absolute paths, symlinks to `/etc/passwd`, and a decompression bomb.
+Every fixture is built in memory, so nothing malicious is ever downloaded. It includes
+cases that attack the inspector itself — a tar member named `../../escaped.txt`, an
+absolute path, a symlink to `/etc/passwd`, and a decompression bomb — plus the
+calibration cases that keep it quiet on ordinary packages.
+
+**2. The MCP server against the live registry (22 assertions):**
+
+```bash
+cd mcp && npm install && node smoke.mjs
+```
+
+Covers scoped names, unknown and blank versions, a package with known critical
+advisories, and the `expres`/`express` typosquat case.
+
+**3. The inspector against a real package, end to end:**
+
+```bash
+python3 skills/supply-chain-audit/scripts/inspect_package.py   --name esbuild --version 0.28.2   --tarball https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz   --repo-url https://github.com/evanw/esbuild
+```
+
+`express`, `chalk` and `ms` should come back with **zero findings**. `esbuild` should
+report `install_script`, `process_execution` and `network_egress` — all true, and the
+right answer is *admit with conditions*, not refuse. If a benign package starts
+producing findings, that is the regression to care about: a tool that cries wolf on
+express teaches you to ignore it.
+
+**4. The whole agent** — needs a running TrueForge, per [Setup](#setup):
+
+```bash
+cd sdk
+node audit.mjs express                       # sandbox + tools, no writes
+node audit.mjs express chalk ms              # subagents fan out
+node audit.mjs left-pad --repo you/demo --deny   # the gate fires and is refused
+```
 
 ## Qodo Code Review Evidence
 
