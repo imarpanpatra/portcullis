@@ -1,0 +1,247 @@
+// Run one audit against the Portcullis agent, from the terminal.
+//
+// The chat UI can do this too. What this script exists to show is the two places a
+// turn stops and waits for a person:
+//
+//   tool.approval_required   the agent wants to write to a repository
+//   tool.response_required   the agent is asking a question it should not guess
+//
+// Both end the turn. Resuming means opening a new one carrying the decision, so a
+// client that ignores either simply never gets a result -- the gate lives in the
+// harness, not in the politeness of the client.
+//
+//   node audit.mjs express
+//   node audit.mjs left-pad --repo imarpanpatra/portcullis-demo
+//   node audit.mjs lodash --deny        (refuse the write without being asked)
+
+import readline from "node:readline/promises";
+import { stdin, stdout } from "node:process";
+import { TrueForge, isEventDelta, mergeEventDelta } from "@truefoundry/trueforge-sdk";
+
+const AGENT_NAME = "portcullis";
+const MAX_ROUNDS = 8;
+
+function parseArgs(argv) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === "--repo") flags.repo = argv[++i];
+    else if (argv[i] === "--deny") flags.deny = true;
+    else positional.push(argv[i]);
+  }
+  return { pkg: positional[0], ...flags };
+}
+
+const args = parseArgs(process.argv.slice(2));
+if (!args.pkg) {
+  console.error("usage: node audit.mjs <package> [--repo owner/name] [--deny]");
+  console.error("\nThere is deliberately no --yes. See the note at the bottom of this file.");
+  process.exit(1);
+}
+
+const client = new TrueForge({
+  baseUrl: process.env.TRUEFORGE_BASE_URL ?? "http://localhost:8790",
+  token: process.env.TRUEFORGE_TOKEN,
+  timeoutInSeconds: 900, // audits unpack tarballs in a sandbox; they are not quick
+});
+
+const rule = (label) => console.log(`\n${"-".repeat(72)}\n${label}\n${"-".repeat(72)}`);
+
+async function ask(prompt) {
+  const rl = readline.createInterface({ input: stdin, output: stdout });
+  try {
+    return (await rl.question(prompt)).trim();
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * Stream one turn, printing the agent's reply as it arrives and keeping an index of
+ * every event by id. The index is what makes a pause actionable: a pause names a
+ * tool call, and the call itself lives on an earlier model.message.
+ */
+async function runTurn(sessionId, input) {
+  const events = new Map();
+  const pendingApprovals = [];
+  const pendingQuestions = [];
+
+  const stream = await client.sessions.createTurnStream(sessionId, { input });
+
+  for await (const { data: event } of stream.withMetadata()) {
+    if (isEventDelta(event)) {
+      const base = events.get(event.id);
+      if (base) mergeEventDelta(base, event);
+      if (event.threadId === "main" && event.content) stdout.write(event.content);
+      continue;
+    }
+
+    events.set(event.id, event);
+
+    switch (event.type) {
+      case "thread.created":
+        console.log(`\n  [subagent] ${event.title ?? event.threadId}`);
+        break;
+      case "model.message":
+        for (const call of event.toolCalls ?? []) {
+          console.log(`\n  -> ${call.toolInfo?.name ?? call.function?.name}`);
+        }
+        break;
+      case "tool.approval_required":
+        pendingApprovals.push(event);
+        break;
+      case "tool.response_required":
+        pendingQuestions.push(event);
+        break;
+      default:
+        break;
+    }
+  }
+
+  return { events, pendingApprovals, pendingQuestions };
+}
+
+/** Resolve a pending event's refs into the concrete calls they point at. */
+function describePending(events, pending) {
+  const described = [];
+  for (const ref of pending.toolCalls ?? []) {
+    const source = events.get(ref.sourceEventId);
+    if (source?.type !== "model.message") continue;
+    const call = (source.toolCalls ?? []).find((tc) => tc.id === ref.id);
+    if (!call) continue;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(call.function?.arguments ?? "{}");
+    } catch {
+      parsed = call.function?.arguments ?? {};
+    }
+    described.push({
+      threadId: pending.threadId,
+      id: ref.id,
+      name: call.toolInfo?.name ?? call.function?.name ?? "(unnamed tool)",
+      arguments: parsed,
+    });
+  }
+  return described;
+}
+
+/**
+ * The agent asked something it should not guess at -- most often "did you mean
+ * express?" when the package named looks like a typo of a far more popular one.
+ * Without this the turn ends here and the audit never reaches a verdict.
+ */
+async function answerQuestions(calls) {
+  const answers = [];
+  for (const call of calls) {
+    const question = call.arguments?.question ?? "(the agent asked a question)";
+    const options = Array.isArray(call.arguments?.options) ? call.arguments.options : [];
+
+    console.log(`\n${question}`);
+    options.forEach((option, index) => {
+      const label = typeof option === "string" ? option : option?.label ?? JSON.stringify(option);
+      console.log(`  ${index + 1}. ${label}`);
+    });
+
+    const reply = await ask(options.length ? "\nchoose a number, or type an answer: " : "\nanswer: ");
+    const chosen = options[Number(reply) - 1];
+    const content =
+      chosen === undefined
+        ? reply
+        : typeof chosen === "string"
+          ? chosen
+          : chosen?.label ?? JSON.stringify(chosen);
+
+    answers.push({
+      type: "user.tool_response",
+      threadId: call.threadId,
+      toolCallId: call.id,
+      content,
+    });
+  }
+  return answers;
+}
+
+async function decideApprovals(calls) {
+  rule("PAUSED - the agent is asking permission before it writes");
+  for (const call of calls) {
+    console.log(`\ntool: ${call.name}`);
+    console.log(`args: ${JSON.stringify(call.arguments, null, 2)}`);
+  }
+
+  const decision = args.deny
+    ? { status: "deny", reason: "denied by the operator" }
+    : (await ask(`\nAllow ${calls.length} call(s)? [y/N] `)).toLowerCase().startsWith("y")
+      ? { status: "allow" }
+      : { status: "deny", reason: "denied by the operator" };
+
+  console.log(`\n${decision.status === "allow" ? "APPROVED" : "DENIED"} - resuming\n`);
+  return calls.map((call) => ({
+    type: "user.tool_approval",
+    threadId: call.threadId,
+    toolCallId: call.id,
+    approval: decision,
+  }));
+}
+
+async function main() {
+  const question = args.repo
+    ? `Can I add the npm package "${args.pkg}" to ${args.repo}? Audit it first, and if it passes, open the pull request that adds it.`
+    : `Audit the npm package "${args.pkg}" and tell me whether it is safe to add to a project.`;
+
+  const { data: session } = await client.sessions.create({ agent: { name: AGENT_NAME } });
+  rule(`session ${session.id}  |  agent ${AGENT_NAME}  |  package ${args.pkg}`);
+
+  let input = [{ type: "user.message", content: question }];
+
+  // Every pause ends a turn, so resuming means opening a new one. This runs until
+  // the agent finishes a turn without asking for anything.
+  for (let round = 0; round < MAX_ROUNDS; round += 1) {
+    const { events, pendingApprovals, pendingQuestions } = await runTurn(session.id, input);
+
+    if (pendingApprovals.length === 0 && pendingQuestions.length === 0) {
+      rule("done");
+      return;
+    }
+
+    const next = [];
+
+    if (pendingQuestions.length > 0) {
+      const asked = pendingQuestions.flatMap((pending) => describePending(events, pending));
+      rule("PAUSED - the agent is asking a question");
+      next.push(...(await answerQuestions(asked)));
+    }
+
+    if (pendingApprovals.length > 0) {
+      const calls = pendingApprovals.flatMap((pending) => describePending(events, pending));
+      next.push(...(await decideApprovals(calls)));
+    }
+
+    input = next;
+  }
+
+  rule(`stopped after ${MAX_ROUNDS} rounds of pauses`);
+}
+
+main().catch((error) => {
+  const message = String(error?.message ?? error);
+  if (message.includes("fetch failed")) {
+    console.error("\nCould not reach TrueForge. Start it with: npx @truefoundry/trueforge@latest");
+  } else if (message.includes("404")) {
+    console.error(`\nNo agent named "${AGENT_NAME}". Run: node create-agent.mjs`);
+  } else {
+    console.error(`\n${message}`);
+  }
+  process.exit(1);
+});
+
+// There is no --yes flag, and that is deliberate.
+//
+// An earlier version had one, to make demos quicker. But the whole claim this
+// project makes is that a person sees the concrete write before it happens, and a
+// flag that pre-approves every gated call in a scripted run defeats exactly that.
+// It would also be the first thing anyone reached for in CI, which is where nobody
+// is watching.
+//
+// --deny stays, because refusing without being asked can only ever result in less
+// happening than the operator intended, never more.
