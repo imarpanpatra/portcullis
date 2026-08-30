@@ -64,7 +64,26 @@ Show the findings: the `postinstall`, the `child_process` use, the egress to
 > install time. The verdict is 'admit with conditions', not 'refuse' — a tool that
 > panics about esbuild is a tool nobody will use."
 
-## 1:55 — The gate (50s)
+## 1:40 — Fan-out (20s)
+
+```bash
+node audit.mjs ms chalk left-pad
+```
+
+Three subagents start at once, one per package. Point at the `[subagent N]` lines.
+
+> "Nobody adds one dependency. Each of these gets its own subagent, they run in
+> parallel, and the results come back merged with a verdict per package — admit,
+> admit, admit-with-conditions. That fan-out is the harness, not something I wrote."
+
+Also point at the session id printed at the top:
+
+> "That session lives on the server. If I close this terminal the work carries on,
+> and I can rejoin it with --session. If the stream drops mid-turn it reattaches to
+> the same turn rather than starting over — which matters, because restarting would
+> re-run writes that already happened."
+
+## 2:00 — The gate (50s)
 
 The agent proposes the pull request and the turn **stops**. The terminal prints the
 tool name and the exact arguments.
@@ -81,7 +100,7 @@ refusal and stop rather than looking for another route.
 > "There is no `--yes` flag, deliberately. A flag that pre-approves every write
 > defeats the only claim this project makes."
 
-## 2:45 — Close (15s)
+## 2:50 — Close (10s)
 
 > "Four connectors' worth of real data, a sandbox doing the dangerous part, and a
 > gate that a client cannot talk its way past. Every change here went through a

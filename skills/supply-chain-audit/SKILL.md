@@ -125,6 +125,25 @@ Then render a Generative UI summary: the verdict, the signals as a small table
 (age, downloads, maintainers, advisories, install hooks), and the findings ranked
 by severity with their file and line.
 
+## Auditing several packages at once
+
+A reviewer adding a dependency is usually adding four. When you are handed more than
+one, or handed a `package.json` to go through, **fan out**: one subagent per package,
+each given the package name, the version, and the instruction to run the procedure
+above and report its findings back.
+
+The audits are genuinely independent -- what you learn about one package changes
+nothing about another -- so running them in sequence makes the reviewer wait on the
+slowest tarball for no reason at all. It also keeps each audit's raw tool output in
+its own context instead of piling every packument into yours.
+
+Merge what comes back into one report ranked by severity, and give **a verdict per
+package**. Do not collapse them into a single answer for the set: admitting four and
+refusing the fifth is the normal result, and a reviewer needs to know which is which.
+If one subagent could not complete -- a tarball that would not download, a repository
+that could not be read -- say so for that package rather than letting a gap disappear
+into a summary.
+
 ## Admitting the package
 
 Only after the user has seen the verdict, and only if they ask for it, add the
