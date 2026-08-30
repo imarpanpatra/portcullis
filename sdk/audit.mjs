@@ -26,16 +26,22 @@ function parseArgs(argv) {
   const flags = {};
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === "--repo") flags.repo = argv[++i];
+    else if (argv[i] === "--session") flags.session = argv[++i];
     else if (argv[i] === "--deny") flags.deny = true;
     else positional.push(argv[i]);
   }
-  return { pkg: positional[0], ...flags };
+  return { packages: positional, ...flags };
 }
 
 const args = parseArgs(process.argv.slice(2));
-if (!args.pkg) {
-  console.error("usage: node audit.mjs <package> [--repo owner/name] [--deny]");
-  console.error("\nThere is deliberately no --yes. See the note at the bottom of this file.");
+if (args.packages.length === 0) {
+  console.error("usage: node audit.mjs <package...> [--repo owner/name] [--session id] [--deny]");
+  console.error("");
+  console.error("  node audit.mjs express                     audit one package");
+  console.error("  node audit.mjs express chalk ms            audit several, in parallel");
+  console.error("  node audit.mjs express --session sess-abc  continue an earlier session");
+  console.error("");
+  console.error("There is deliberately no --yes. See the note at the bottom of this file.");
   process.exit(1);
 }
 
@@ -86,42 +92,78 @@ function closePrompt() {
  * every event by id. The index is what makes a pause actionable: a pause names a
  * tool call, and the call itself lives on an earlier model.message.
  */
+const MAX_RECONNECTS = 3;
+
 async function runTurn(sessionId, input) {
   const events = new Map();
   const pendingApprovals = [];
   const pendingQuestions = [];
+  const threads = new Map();
+  let turnId = null;
+  let done = false;
 
-  const stream = await client.sessions.createTurnStream(sessionId, { input });
+  // Consume one stream until it ends, recording what we learn. Returns normally
+  // when the turn finishes and throws if the connection breaks mid-flight, which
+  // the caller treats as something to reconnect to rather than something fatal.
+  const consume = async (stream) => {
+    for await (const { data: event } of stream.withMetadata()) {
+      if (isEventDelta(event)) {
+        const base = events.get(event.id);
+        if (base) mergeEventDelta(base, event);
+        if (event.threadId === "main" && event.content) stdout.write(event.content);
+        continue;
+      }
 
-  for await (const { data: event } of stream.withMetadata()) {
-    if (isEventDelta(event)) {
-      const base = events.get(event.id);
-      if (base) mergeEventDelta(base, event);
-      if (event.threadId === "main" && event.content) stdout.write(event.content);
-      continue;
+      events.set(event.id, event);
+
+      switch (event.type) {
+        case "turn.created":
+          turnId = event.turnId ?? event.id;
+          break;
+        case "thread.created":
+          threads.set(event.threadId, event.title ?? event.threadId);
+          console.log(`\n  [subagent ${threads.size}] ${event.title ?? event.threadId}`);
+          break;
+        case "thread.done":
+          console.log(`\n  [subagent done] ${threads.get(event.threadId) ?? event.threadId}`);
+          break;
+        case "model.message":
+          for (const call of event.toolCalls ?? []) {
+            const where = event.threadId === "main" ? "" : "     ";
+            console.log(`\n  ${where}-> ${call.toolInfo?.name ?? call.function?.name}`);
+          }
+          break;
+        case "tool.approval_required":
+          pendingApprovals.push(event);
+          break;
+        case "tool.response_required":
+          pendingQuestions.push(event);
+          break;
+        case "turn.done":
+          done = true;
+          break;
+        default:
+          break;
+      }
     }
+  };
 
-    events.set(event.id, event);
+  await consume(await client.sessions.createTurnStream(sessionId, { input }));
 
-    switch (event.type) {
-      case "thread.created":
-        console.log(`\n  [subagent] ${event.title ?? event.threadId}`);
-        break;
-      case "model.message":
-        for (const call of event.toolCalls ?? []) {
-          console.log(`\n  -> ${call.toolInfo?.name ?? call.function?.name}`);
-        }
-        break;
-      case "tool.approval_required":
-        pendingApprovals.push(event);
-        break;
-      case "tool.response_required":
-        pendingQuestions.push(event);
-        break;
-      default:
-        break;
+  // The turn runs on the server, not in this process. If the stream drops, the
+  // work carries on without us, so the right response is to attach to it again
+  // rather than to start over -- restarting would re-run tool calls that already
+  // happened. subscribeToTurn picks the same turn back up.
+  for (let attempt = 1; !done && turnId && attempt <= MAX_RECONNECTS; attempt += 1) {
+    console.log(`\n  [stream ended before the turn finished; reattaching (${attempt})]`);
+    try {
+      await consume(await client.sessions.subscribeToTurn(sessionId, turnId));
+    } catch (error) {
+      console.log(`  [reattach failed: ${error?.message ?? error}]`);
     }
   }
+
+  if (threads.size) console.log(`\n  (${threads.size} subagent(s) ran in this turn)`);
 
   return { events, pendingApprovals, pendingQuestions };
 }
@@ -222,13 +264,50 @@ async function decideApprovals(calls) {
   }));
 }
 
-async function main() {
-  const question = args.repo
-    ? `Can I add the npm package "${args.pkg}" to ${args.repo}? Audit it first, and if it passes, open the pull request that adds it.`
-    : `Audit the npm package "${args.pkg}" and tell me whether it is safe to add to a project.`;
+function buildQuestion() {
+  const many = args.packages.length > 1;
+  const list = args.packages.map((name) => `"${name}"`).join(", ");
 
-  const { data: session } = await client.sessions.create({ agent: { name: AGENT_NAME } });
-  rule(`session ${session.id}  |  agent ${AGENT_NAME}  |  package ${args.pkg}`);
+  if (args.repo) {
+    return many
+      ? `Can I add these npm packages to ${args.repo}: ${list}? Audit each one -- in parallel, one subagent per package -- and give a verdict for each. Then open a pull request adding the ones that pass.`
+      : `Can I add the npm package ${list} to ${args.repo}? Audit it first, and if it passes, open the pull request that adds it.`;
+  }
+  return many
+    ? `Audit these npm packages and tell me whether each is safe to add: ${list}. Do them in parallel, one subagent per package, and give a verdict for each.`
+    : `Audit the npm package ${list} and tell me whether it is safe to add to a project.`;
+}
+
+/**
+ * Reuse a session when one is named, rather than always starting fresh.
+ *
+ * Sessions hold their context on the server, so a resumed one already knows what
+ * was audited and decided earlier -- the client going away does not end the
+ * conversation. That is worth exercising rather than assuming: an agent that only
+ * works while one terminal stays open is a script with extra steps.
+ */
+async function openSession() {
+  if (!args.session) {
+    const { data: created } = await client.sessions.create({ agent: { name: AGENT_NAME } });
+    return created;
+  }
+
+  const { data } = await client.sessions.get(args.session);
+  const existing = data?.id ? data : (data?.data ?? { id: args.session });
+
+  let earlier = 0;
+  for await (const _turn of await client.sessions.listTurns(existing.id)) earlier += 1;
+  console.log(`\nresuming session ${existing.id} — ${earlier} earlier turn(s) already in it`);
+  return existing;
+}
+
+async function main() {
+  const question = buildQuestion();
+  const session = await openSession();
+
+  const label = args.packages.length > 1 ? "packages" : "package";
+  rule(`session ${session.id}  |  agent ${AGENT_NAME}  |  ${label} ${args.packages.join(", ")}`);
+  console.log(`continue this session later:  node audit.mjs <package> --session ${session.id}\n`);
 
   let input = [{ type: "user.message", content: question }];
 
