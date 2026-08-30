@@ -559,6 +559,23 @@ class ReportContractTests(unittest.TestCase):
         self.assertIsInstance(report, dict)
         self.assertIn("error", report)
 
+    def test_positive_build_evidence_survives_truncation(self):
+        """Truncation can hide a tsconfig; it cannot un-find one already read."""
+        npm_root = extract_to_temp(make_tarball({"package.json": "{}", "index.js": "published"}))
+        repo = make_tarball(
+            {"tsconfig.json": "{}", "index.js": "different"}
+            | {f"src/f{i}.js": "x" for i in range(40)},
+            root="repo-1.0.0",
+        )
+        with mock.patch.object(inspector, "MAX_MEMBERS", 4):
+            findings, stats = inspector.compare_with_source(npm_root, repo)
+
+        self.assertTrue(stats["repo_tree_truncated"])
+        self.assertTrue(stats["repo_has_build_step"])
+        detail = finding_for(findings, "index.js")["detail"]
+        self.assertIn("has a build step", detail)
+        self.assertNotIn("could not be established", detail)
+
 
 class RepoTreeResolutionTests(unittest.TestCase):
     """"Not found" and "could not look" are different claims and must not merge."""

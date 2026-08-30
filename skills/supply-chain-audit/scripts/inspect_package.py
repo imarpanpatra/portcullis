@@ -643,7 +643,12 @@ def compare_with_source(npm_root, repo_bytes):
                 # and say the classification is uncertain, rather than asserting
                 # "no build step" about a project whose build files may simply be
                 # past the cutoff.
-                if repo_truncated:
+                # Truncation is asymmetric here. Having *found* a build config or a
+                # compilable file is positive evidence, and dropping later members
+                # cannot un-find it -- so a truncated tree that already said "built"
+                # still knows that. Only the negative is unreliable: not having seen
+                # one may just mean it sat past the cutoff.
+                if repo_truncated and not repo_is_built:
                     detail = (
                         "This file ships at the same path as one in the repository, but the "
                         "contents are not the same. Read both before accepting it. The "
