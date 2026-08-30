@@ -1,5 +1,8 @@
 # Demo script (about three minutes)
 
+> The recorded result: **https://youtu.be/t042CZAsOuM**
+
+
 The recording has to show three things, because a judge is checking for them
 specifically: the harness reaching a real tool, code running in a sandbox, and the
 agent stopping for a person before something irreversible.
