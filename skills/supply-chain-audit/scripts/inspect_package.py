@@ -45,7 +45,7 @@ MAX_EXTRACTED_BYTES = 150 * 1024 * 1024
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_FILES_SCANNED = 3000
 
-SOURCE_SUFFIXES = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx")
+SOURCE_SUFFIXES = (".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts")
 DECLARATION_SUFFIXES = (".d.ts", ".d.mts", ".d.cts")
 COMPILABLE_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".jsx", ".coffee")
 
@@ -581,6 +581,12 @@ def compare_with_source(npm_root, repo_bytes):
         relocated = 0
         compiled_counterpart = 0
 
+        def capped(severity):
+            # Every provenance claim rests on the repository index being complete.
+            # While it is not, none of them can be made with confidence -- including
+            # the ones that come from finding a counterpart rather than missing one.
+            return "low" if repo_truncated else severity
+
         def severity_for_missing(relative):
             if repo_truncated:
                 return "low"
@@ -611,7 +617,7 @@ def compare_with_source(npm_root, repo_bytes):
                 findings.append(
                     Finding(
                         "tarball_source_differs",
-                        "medium" if repo_is_built else "high",
+                        capped("medium" if repo_is_built else "high"),
                         "This file ships at the same path as one in the repository, but the "
                         "contents are not the same. Read both before accepting it."
                         + (
@@ -639,7 +645,7 @@ def compare_with_source(npm_root, repo_bytes):
                 findings.append(
                     Finding(
                         "tarball_source_differs",
-                        "medium" if repo_is_built else "high",
+                        capped("medium" if repo_is_built else "high"),
                         f"Published as {relative}, which appears to correspond to "
                         f"{same_kind[0]} in the repository, but the contents differ.",
                         path=relative,

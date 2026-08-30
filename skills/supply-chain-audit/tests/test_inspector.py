@@ -384,6 +384,25 @@ class FileClassificationTests(unittest.TestCase):
         self.assertEqual(stats["files_scanned"], 0)
 
 
+    def test_modern_module_suffixes_are_treated_as_source(self):
+        """.mts and .cts are executable modules, not merely compilable."""
+        for suffix in (".mts", ".cts"):
+            root = extract_to_temp(
+                make_tarball(
+                    {"package.json": "{}", f"mod{suffix}": 'require("child_process");'}
+                )
+            )
+            findings, stats = inspector.scan_sources(root)
+            self.assertIn("process_execution", checks(findings), suffix)
+            self.assertEqual(stats["files_scanned"], 1, suffix)
+
+    def test_modern_module_suffixes_get_provenance(self):
+        npm_root = extract_to_temp(make_tarball({"package.json": "{}", "smuggled.mts": "payload"}))
+        repo = make_tarball({"package.json": "{}", "index.js": "ok"}, root="repo-1.0.0")
+        findings, _ = inspector.compare_with_source(npm_root, repo)
+        self.assertEqual(finding_for(findings, "smuggled.mts")["check"], "tarball_only_source")
+
+
 class BuildStepDetectionTests(unittest.TestCase):
     def test_type_declarations_alone_do_not_imply_a_build_step(self):
         """A plain JS repo that ships typings must not have its findings downgraded."""
@@ -440,6 +459,21 @@ class TruncatedRepositoryTests(unittest.TestCase):
         for finding in findings:
             if finding["check"] == "tarball_only_source":
                 self.assertEqual(finding["severity"], "low")
+
+    def test_a_partial_tree_also_caps_content_mismatch_findings(self):
+        """A file whose match lies past the cutoff would otherwise read as a false high."""
+        npm_root = extract_to_temp(make_tarball({"package.json": "{}", "index.js": "published"}))
+        repo = make_tarball(
+            {f"src/f{i}.js": "x" for i in range(40)}
+            | {"package.json": "{}", "index.js": "different"},
+            root="repo-1.0.0",
+        )
+        with mock.patch.object(inspector, "MAX_MEMBERS", 5):
+            findings, stats = inspector.compare_with_source(npm_root, repo)
+
+        self.assertTrue(stats["repo_tree_truncated"])
+        for finding in findings:
+            self.assertEqual(finding["severity"], "low", finding["check"])
 
 
 class SummaryTests(unittest.TestCase):
