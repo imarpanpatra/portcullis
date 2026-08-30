@@ -121,9 +121,94 @@ Commit to one of three, and say which:
   `--ignore-scripts`, or prefer a named alternative. State the condition.
 - **Refuse** — say exactly which finding drives the refusal. One sentence.
 
-Then render a Generative UI summary: the verdict, the signals as a small table
-(age, downloads, maintainers, advisories, install hooks), and the findings ranked
-by severity with their file and line.
+### Render the report as Generative UI
+
+**Emit the report inside an `openui` fenced block, not as markdown tables.** The chat
+UI renders that block as real components -- cards, tables, callouts -- and a markdown
+table is a flat wall of pipes by comparison. This is the part of the answer the
+reader actually looks at, so it is worth the few extra tokens.
+
+The person reading has to see three things at a glance: what you decided, what you
+looked at, and what you could not check. Use the same shape every run, so a reader
+learns it once. Fill in the values; keep the structure.
+
+Every name you put in `root` must be defined below it. A reference to a component
+you decided not to emit is a broken block, and a broken block renders as nothing at
+all -- so build `root` from the cards you actually have:
+
+```openui
+root = Stack([verdict, signals, findings], "column", "m")
+```
+
+and only when there are limitations to report:
+
+```openui
+root = Stack([verdict, signals, findings, gaps], "column", "m")
+```
+
+```openui
+verdict = Callout(<tone>, "<Verdict>: <package>@<version>", "<one sentence, the reason>")
+```
+
+`tone` is `"success"` to admit, `"warning"` to admit with conditions, `"danger"` to
+refuse. The title carries the decision and the exact version it applies to -- a
+verdict without a version is not a verdict.
+
+```openui
+signals = Card([CardHeader("What I looked at", "Registry and tarball"), signalsTable])
+signalsTable = Table([Col("Signal", names), Col("Value", values), Col("Source", sources)])
+```
+
+One row each for age, weekly downloads, maintainers, advisories, install hooks, and
+the tarball inspection (files scanned, whether the source comparison ran). The
+`Source` column names the tool the number came from, so every figure on screen can
+be traced back.
+
+```openui
+findings = Card([CardHeader("Findings", "<n> kept, <m> dropped as false positives"), findingsTable])
+findingsTable = Table([Col("Severity", ...), Col("Finding", ...), Col("File", ...), Col("Disposition", ...)])
+```
+
+**Show the dropped candidates too, with why.** A reader who sees only what survived
+cannot tell a careful audit from a shallow one, and the dropped rows are the
+evidence that you checked rather than repeated. If nothing was found at all, say so
+in one row rather than hiding the table.
+
+```openui
+gaps = Card([CardHeader("What I could not check", "..."), TextContent(...)])
+```
+
+Include this **only when there are limitations**, and never omit it when there are.
+A gap that is not on screen may as well not have been reported. Remember to leave
+`gaps` out of `root` too when you leave it out here.
+
+When several packages were audited, lead with one `Table` of package, version and
+verdict, then a `Card` per package underneath in the same shape as above.
+
+Keep the prose outside the block short. The card is the report; the text around it
+should not repeat it -- one line naming the verdict is enough, since the callout
+already carries it.
+
+Only registered components render; anything else silently produces nothing. The ones
+worth knowing here:
+
+| Purpose | Components |
+| --- | --- |
+| Layout | `Stack`, `Separator`, `Tabs` + `TabItem`, `Accordion` + `AccordionItem`, `Steps` + `StepsItem` |
+| Content | `Card`, `CardHeader`, `TextContent`, `MarkDownRenderer`, `CodeBlock`, `Callout`, `TextCallout`, `Tag` + `TagBlock` |
+| Data | `Table` + `Col`, `ListBlock` + `ListItem` |
+| Charts | `BarChart`, `HorizontalBarChart`, `LineChart`, `AreaChart`, `PieChart`, `RadialChart` (each with `Series`) |
+
+Note the exact spelling of `MarkDownRenderer`. The table above is what the shipped
+renderer actually registers; `List`, `Progress` and `Link` are **not** among them, so
+use `ListBlock`/`ListItem` and put links inside markdown text instead.
+
+If you are unsure whether a component exists, use `MarkDownRenderer` rather than
+guessing. An unregistered name is dropped silently, and a report that renders as
+nothing is worse than a plain one.
+
+Prefer the plain ones. Reach for a chart only when there is genuinely a distribution
+worth seeing, which for a single package there is not.
 
 ## Auditing several packages at once
 

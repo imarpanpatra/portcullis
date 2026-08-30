@@ -34,6 +34,7 @@ A chat window could describe supply-chain risk in the abstract. It could not do 
 | Ask rather than guess | `ask_user_question` — used the moment a package name looks like a typo |
 | Audit several packages at once | Subagents — one per package, run in parallel, results merged into one ranked report |
 | Survive the client going away | Sessions hold context server-side, and a dropped stream reattaches to the same turn rather than restarting it |
+| Show a person what is happening | Generative UI — the verdict, the signals with the tool each came from, and the findings kept *and dropped*, rendered as components in the chat UI |
 
 Take the harness away and the project stops being possible, not merely less convenient.
 
@@ -103,6 +104,17 @@ npm run create-agent
 `create-agent` is create-or-replace, so if you get this wrong just export the right model and run it again — it updates the existing agent rather than making a second one. The line it prints as `Model :` is the one the agent will actually use; check it.
 
 Other environment variables: `TRUEFORGE_BASE_URL`, `PORTCULLIS_MCP_URL`, `PORTCULLIS_SKILL_REPO`, `PORTCULLIS_SKILL_REF`.
+
+## Two ways to drive it
+
+**The chat UI** at `http://localhost:8790` — shipped with TrueForge. Pick the
+`portcullis` agent and ask it about a package. It streams the agent's steps, shows a
+thread per subagent, renders the audit report as components rather than markdown, and
+puts **Allow / Deny** in front of the write with the tool and its arguments on screen.
+This is the one to use if you only try it once.
+
+**The terminal**, below, for driving the same agent from code — and for showing that
+the approval gate lives in the harness rather than in the client's manners.
 
 ## Running an audit
 

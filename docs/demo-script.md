@@ -4,18 +4,29 @@ The recording has to show three things, because a judge is checking for them
 specifically: the harness reaching a real tool, code running in a sandbox, and the
 agent stopping for a person before something irreversible.
 
-Have running beforehand: TrueForge on 8790, the npm MCP server on 8941, a terminal,
-and a throwaway public repo with a `package.json`.
+## Record the chat UI, not the terminal
 
-Set the model before the agent is created, and check the `Model :` line:
+Use **http://localhost:8790**, the chat UI TrueForge ships with. It shows the agent's
+steps as they happen, renders the audit report as real components rather than a wall
+of markdown, lists subagents as separate threads, and puts **Allow / Deny buttons** in
+front of the write. A terminal shows the same events as scrolling text.
+
+Keep a terminal open as a second, brief shot — it makes the point that the same agent
+is drivable from code, and `--deny` is quicker to demonstrate there. But the chat UI
+carries the demo.
+
+Before recording, in a terminal:
 
 ```bash
 export PORTCULLIS_MODEL=openai/gpt-5-5
-cd sdk && npm run create-agent
+cd sdk && npm run create-agent      # check the "Model :" line it prints
 ```
 
 A mini-class model skips the tarball inspection and answers from registry data alone,
 which would quietly remove the sandbox from the demo you are about to record.
+
+Have running: TrueForge on 8790, the npm MCP server on 8941, and a throwaway public
+repo with a `package.json`. Clear the terminal scrollback — API keys are in it.
 
 ## 0:00 — The problem (20s)
 
@@ -107,6 +118,19 @@ refusal and stop rather than looking for another route.
 > Qodo-reviewed pull request — seventeen findings, all answered."
 
 Show the PR list with the Qodo threads.
+
+## What the chat UI is showing, in the judges' words
+
+The UI criteria ask for an interface that shows *what the agent is doing, what it is
+waiting on, and what it did, and asks before the irreversible step rather than after
+it.* Point at each while recording:
+
+| Criterion | Where it is on screen |
+| --- | --- |
+| what it is doing | agent steps streaming, one thread per subagent |
+| what it is waiting on | the approval card, with the tool and its arguments |
+| what it did | the rendered report: verdict, signals with sources, findings kept and dropped |
+| asks before, not after | the Allow / Deny buttons, with the turn stopped behind them |
 
 ## Recording notes
 
