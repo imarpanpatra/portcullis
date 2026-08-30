@@ -199,8 +199,13 @@ worth knowing here:
 | Data | `Table` + `Col`, `ListBlock` + `ListItem` |
 | Charts | `BarChart`, `HorizontalBarChart`, `LineChart`, `AreaChart`, `PieChart`, `RadialChart` (each with `Series`) |
 
-Note the exact spelling of `MarkDownRenderer`. There is no `List`, no `Progress` and
-no `Link` component -- use `ListBlock`/`ListItem`, and put links in markdown text.
+Note the exact spelling of `MarkDownRenderer`. The table above is what the shipped
+renderer actually registers; `List`, `Progress` and `Link` are **not** among them, so
+use `ListBlock`/`ListItem` and put links inside markdown text instead.
+
+If you are unsure whether a component exists, use `MarkDownRenderer` rather than
+guessing. An unregistered name is dropped silently, and a report that renders as
+nothing is worse than a plain one.
 
 Prefer the plain ones. Reach for a chart only when there is genuinely a distribution
 worth seeing, which for a single package there is not.
