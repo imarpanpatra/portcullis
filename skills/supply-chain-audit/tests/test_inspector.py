@@ -13,6 +13,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import urllib.error
 import unittest
 from unittest import mock
 
@@ -546,6 +547,52 @@ class ReportContractTests(unittest.TestCase):
 
         self.assertIsInstance(report, dict)
         self.assertIn("error", report)
+
+
+class RepoTreeResolutionTests(unittest.TestCase):
+    """"Not found" and "could not look" are different claims and must not merge."""
+
+    @staticmethod
+    def _http_error(code):
+        return urllib.error.HTTPError("u", code, "err", None, None)
+
+    def test_a_genuine_404_on_both_tags_reports_the_tag_as_absent(self):
+        def only_404(url):
+            raise RepoTreeResolutionTests._http_error(404)
+
+        with mock.patch.object(inspector, "fetch", only_404):
+            data, reason = inspector.fetch_repo_tree("https://github.com/o/r", "1.0.0")
+
+        self.assertIsNone(data)
+        self.assertIn("No tag matching", reason)
+
+    def test_a_timeout_is_not_overwritten_by_a_later_404(self):
+        seen = []
+
+        def timeout_then_404(url):
+            seen.append(url)
+            if len(seen) == 1:
+                raise TimeoutError("read timed out")
+            raise RepoTreeResolutionTests._http_error(404)
+
+        with mock.patch.object(inspector, "fetch", timeout_then_404):
+            data, reason = inspector.fetch_repo_tree("https://github.com/o/r", "1.0.0")
+
+        self.assertIsNone(data)
+        self.assertEqual(len(seen), 2)
+        self.assertIn("could not be read", reason)
+        self.assertIn("not the same as the tag being absent", reason)
+        self.assertNotIn("No tag matching", reason)
+
+    def test_a_non_404_http_error_is_also_treated_as_unresolved(self):
+        def server_error(url):
+            raise RepoTreeResolutionTests._http_error(503)
+
+        with mock.patch.object(inspector, "fetch", server_error):
+            data, reason = inspector.fetch_repo_tree("https://github.com/o/r", "1.0.0")
+
+        self.assertIsNone(data)
+        self.assertIn("HTTP 503", reason)
 
 
 class RepoSlugTests(unittest.TestCase):

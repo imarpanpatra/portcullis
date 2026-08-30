@@ -516,26 +516,31 @@ def fetch_repo_tree(repo_url, version):
         return None, "The package does not link to a GitHub repository."
     owner, repo = slug
 
-    last_error = None
+    # Two failures mean different things. A 404 says the tag is genuinely not there,
+    # which is a fact about the repository. Anything else -- a timeout, a reset
+    # connection -- says only that we could not find out. Keeping just the last
+    # error would let a 404 on the second candidate overwrite a timeout on the
+    # first, and the audit would then report "no such tag" about a tag it never
+    # actually managed to look at.
+    unresolved = []
     for ref in (f"refs/tags/v{version}", f"refs/tags/{version}"):
         url = f"https://codeload.github.com/{owner}/{repo}/tar.gz/{ref}"
         try:
             return fetch(url), None
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                unresolved.append(f"{ref}: HTTP {error.code}")
         except Exception as error:  # noqa: BLE001
             # Deliberately broad. A read that times out raises TimeoutError rather
             # than URLError, and naming the failures individually means the next
             # unnamed one escapes and takes a finished package report with it.
-            # Nothing here is worth aborting an audit for: a missing comparison is
-            # a limitation to report, not a reason to lose everything else.
-            last_error = error
-            continue
+            unresolved.append(f"{ref}: {error}")
 
-    if last_error is not None and not isinstance(
-        last_error, (urllib.error.HTTPError, urllib.error.URLError, ValueError)
-    ):
+    if unresolved:
         return None, (
-            f"The repository at {owner}/{repo} could not be read ({last_error}), so the "
-            "published tarball was not compared against reviewed source."
+            f"The repository at {owner}/{repo} could not be read ({'; '.join(unresolved)}), so "
+            "the published tarball was not compared against reviewed source. This is not the "
+            "same as the tag being absent -- it is unknown whether it exists."
         )
 
     return None, (
