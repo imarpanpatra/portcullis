@@ -516,12 +516,27 @@ def fetch_repo_tree(repo_url, version):
         return None, "The package does not link to a GitHub repository."
     owner, repo = slug
 
+    last_error = None
     for ref in (f"refs/tags/v{version}", f"refs/tags/{version}"):
         url = f"https://codeload.github.com/{owner}/{repo}/tar.gz/{ref}"
         try:
             return fetch(url), None
-        except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
+        except Exception as error:  # noqa: BLE001
+            # Deliberately broad. A read that times out raises TimeoutError rather
+            # than URLError, and naming the failures individually means the next
+            # unnamed one escapes and takes a finished package report with it.
+            # Nothing here is worth aborting an audit for: a missing comparison is
+            # a limitation to report, not a reason to lose everything else.
+            last_error = error
             continue
+
+    if last_error is not None and not isinstance(
+        last_error, (urllib.error.HTTPError, urllib.error.URLError, ValueError)
+    ):
+        return None, (
+            f"The repository at {owner}/{repo} could not be read ({last_error}), so the "
+            "published tarball was not compared against reviewed source."
+        )
 
     return None, (
         f"No tag matching version {version} was found in {owner}/{repo}, so the published "
@@ -773,7 +788,14 @@ def audit(name, version, tarball_url, repo_url=None):
         except Exception as error:  # noqa: BLE001
             report["limitations"].append(f"Source scan failed: {error}")
 
-        repo_bytes, reason = fetch_repo_tree(repo_url, version)
+        # Guarded at the call site as well. fetch_repo_tree is careful, but this
+        # function's contract is that it returns a report rather than raising, and
+        # that promise should not depend on one helper staying careful forever.
+        try:
+            repo_bytes, reason = fetch_repo_tree(repo_url, version)
+        except Exception as error:  # noqa: BLE001
+            repo_bytes, reason = None, f"Could not fetch the source repository: {error}"
+
         if repo_bytes is None:
             report["limitations"].append(reason)
         else:

@@ -510,6 +510,44 @@ class SummaryTests(unittest.TestCase):
         self.assertIsNone(inspector.summarise([])["highest_severity"])
 
 
+class ReportContractTests(unittest.TestCase):
+    """audit() promises a report, not an exception. That has to hold under failure."""
+
+    def test_a_repository_timeout_does_not_discard_the_package_findings(self):
+        archive = make_tarball(
+            {"package.json": '{"name":"x","scripts":{"postinstall":"node evil.js"}}'}
+        )
+        calls = []
+
+        def flaky_fetch(url):
+            calls.append(url)
+            if "codeload" in url:
+                raise TimeoutError("read timed out")
+            return archive
+
+        with mock.patch.object(inspector, "fetch", flaky_fetch):
+            report = inspector.audit(
+                "x", "1.0.0", "https://registry.npmjs.org/x.tgz", "https://github.com/o/r"
+            )
+
+        self.assertIsInstance(report, dict)
+        self.assertNotIn("error", report)
+        # The package was still audited; only the comparison was lost.
+        self.assertIn("install_script", checks(report["findings"]))
+        self.assertFalse(report["stats"]["compared_against_source"])
+        self.assertTrue(any("could not be read" in l for l in report["limitations"]), report["limitations"])
+
+    def test_a_tarball_download_failure_returns_a_report_not_an_exception(self):
+        def failing_fetch(url):
+            raise TimeoutError("read timed out")
+
+        with mock.patch.object(inspector, "fetch", failing_fetch):
+            report = inspector.audit("x", "1.0.0", "https://registry.npmjs.org/x.tgz", None)
+
+        self.assertIsInstance(report, dict)
+        self.assertIn("error", report)
+
+
 class RepoSlugTests(unittest.TestCase):
     def test_parses_the_usual_repository_url_shapes(self):
         for url in (
