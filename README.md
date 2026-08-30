@@ -4,6 +4,8 @@
 
 Built on [TrueForge](https://trueforge.dev), TrueFoundry's open-source agent harness, for the [Agent Harness Hackathon](https://www.wemakedevs.org/hackathons/trueforge).
 
+**▶ [Watch the demo (3 min)](https://youtu.be/t042CZAsOuM)** — the typosquat catch, five subagents auditing in parallel, the sandbox opening a real tarball, and the agent stopping to ask before it opens a pull request.
+
 ---
 
 ## The problem
