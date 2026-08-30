@@ -132,9 +132,21 @@ The person reading has to see three things at a glance: what you decided, what y
 looked at, and what you could not check. Use the same shape every run, so a reader
 learns it once. Fill in the values; keep the structure.
 
+Every name you put in `root` must be defined below it. A reference to a component
+you decided not to emit is a broken block, and a broken block renders as nothing at
+all -- so build `root` from the cards you actually have:
+
+```openui
+root = Stack([verdict, signals, findings], "column", "m")
+```
+
+and only when there are limitations to report:
+
 ```openui
 root = Stack([verdict, signals, findings, gaps], "column", "m")
+```
 
+```openui
 verdict = Callout(<tone>, "<Verdict>: <package>@<version>", "<one sentence, the reason>")
 ```
 
@@ -167,7 +179,8 @@ gaps = Card([CardHeader("What I could not check", "..."), TextContent(...)])
 ```
 
 Include this **only when there are limitations**, and never omit it when there are.
-A gap that is not on screen may as well not have been reported.
+A gap that is not on screen may as well not have been reported. Remember to leave
+`gaps` out of `root` too when you leave it out here.
 
 When several packages were audited, lead with one `Table` of package, version and
 verdict, then a `Card` per package underneath in the same shape as above.
@@ -176,11 +189,21 @@ Keep the prose outside the block short. The card is the report; the text around 
 should not repeat it -- one line naming the verdict is enough, since the callout
 already carries it.
 
-Available components: `Stack`, `Card`, `CardHeader`, `Table`, `Col`, `Callout`,
-`TextContent`, `CodeBlock`, `MarkDownRenderer`, `List`, `Progress`, `Accordion`,
-`Tabs`, `BarChart`, `LineChart`, `PieChart`, `Link`, `Image`, `Button`. Prefer the
-plain ones above; reach for a chart only when there is genuinely a distribution
-worth seeing, which for a single package there usually is not.
+Only registered components render; anything else silently produces nothing. The ones
+worth knowing here:
+
+| Purpose | Components |
+| --- | --- |
+| Layout | `Stack`, `Separator`, `Tabs` + `TabItem`, `Accordion` + `AccordionItem`, `Steps` + `StepsItem` |
+| Content | `Card`, `CardHeader`, `TextContent`, `MarkDownRenderer`, `CodeBlock`, `Callout`, `TextCallout`, `Tag` + `TagBlock` |
+| Data | `Table` + `Col`, `ListBlock` + `ListItem` |
+| Charts | `BarChart`, `HorizontalBarChart`, `LineChart`, `AreaChart`, `PieChart`, `RadialChart` (each with `Series`) |
+
+Note the exact spelling of `MarkDownRenderer`. There is no `List`, no `Progress` and
+no `Link` component -- use `ListBlock`/`ListItem`, and put links in markdown text.
+
+Prefer the plain ones. Reach for a chart only when there is genuinely a distribution
+worth seeing, which for a single package there is not.
 
 ## Auditing several packages at once
 
