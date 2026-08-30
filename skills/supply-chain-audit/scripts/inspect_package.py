@@ -582,9 +582,11 @@ def compare_with_source(npm_root, repo_bytes):
         compiled_counterpart = 0
 
         def capped(severity):
-            # Every provenance claim rests on the repository index being complete.
-            # While it is not, none of them can be made with confidence -- including
-            # the ones that come from finding a counterpart rather than missing one.
+            # Truncation undermines claims that rest on the index being *complete* --
+            # "this file is absent", or "this is the only candidate for it". It does
+            # not undermine a claim proved by reading two files that were both
+            # extracted: their hashes differ regardless of what else was omitted.
+            # Only the inferences get capped; the proofs keep their severity.
             return "low" if repo_truncated else severity
 
         def severity_for_missing(relative):
@@ -616,8 +618,11 @@ def compare_with_source(npm_root, repo_bytes):
                     continue
                 findings.append(
                     Finding(
+                        # Not capped: both files were read and their contents differ.
+                        # That is a demonstrated substitution, not an inference from
+                        # an index that may be missing entries.
                         "tarball_source_differs",
-                        capped("medium" if repo_is_built else "high"),
+                        "medium" if repo_is_built else "high",
                         "This file ships at the same path as one in the repository, but the "
                         "contents are not the same. Read both before accepting it."
                         + (

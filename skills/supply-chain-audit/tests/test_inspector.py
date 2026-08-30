@@ -475,6 +475,24 @@ class TruncatedRepositoryTests(unittest.TestCase):
         for finding in findings:
             self.assertEqual(finding["severity"], "low", finding["check"])
 
+    def test_a_proven_mismatch_keeps_its_severity_despite_truncation(self):
+        """Truncation weakens inferences from absence, not a hash comparison.
+
+        Both copies of index.js were read here. That they differ is demonstrated,
+        and unrelated members omitted later in the archive do not make it less so.
+        """
+        npm_root = extract_to_temp(make_tarball({"package.json": "{}", "index.js": "published"}))
+        repo = make_tarball(
+            {"index.js": "substituted", "package.json": "{}"}
+            | {f"src/f{i}.js": "x" for i in range(40)},
+            root="repo-1.0.0",
+        )
+        with mock.patch.object(inspector, "MAX_MEMBERS", 4):
+            findings, stats = inspector.compare_with_source(npm_root, repo)
+
+        self.assertTrue(stats["repo_tree_truncated"])
+        self.assertEqual(severity_of(findings, "tarball_source_differs"), "high")
+
 
 class SummaryTests(unittest.TestCase):
     def test_highest_severity_wins(self):
