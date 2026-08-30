@@ -6,6 +6,8 @@ Built on [TrueForge](https://trueforge.dev), TrueFoundry's open-source agent har
 
 **▶ [Watch the demo (3 min)](https://youtu.be/t042CZAsOuM)** — the typosquat catch, five subagents auditing in parallel, the sandbox opening a real tarball, and the agent stopping to ask before it opens a pull request.
 
+![Five packages audited in parallel, one subagent each, with a verdict per package](assets/portcullis_img_2.png)
+
 ---
 
 ## The problem
