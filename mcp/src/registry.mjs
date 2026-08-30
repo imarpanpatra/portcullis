@@ -40,7 +40,11 @@ export async function getPackageMetadata(name, version) {
   const packument = await getJson(`${REGISTRY}/${encodeName(name)}`);
 
   const distTags = packument["dist-tags"] ?? {};
-  const resolved = version ?? distTags.latest;
+  // A model that does not know the version tends to send an empty string rather
+  // than omitting the field, and `"" ?? latest` is `""`. Treat any blank as absent,
+  // or the caller gets told their own placeholder does not exist.
+  const requested = typeof version === "string" ? version.trim() : version;
+  const resolved = requested || distTags.latest;
   const versionDoc = packument.versions?.[resolved];
   if (!versionDoc) {
     const known = Object.keys(packument.versions ?? {});
