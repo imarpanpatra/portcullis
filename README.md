@@ -80,19 +80,17 @@ In the TrueForge UI:
 - **Settings → Sandbox providers** — choose Daytona and paste an API key. The key needs **Snapshots create** permission as well as Sandboxes; without it, configuring the provider fails even though the key is otherwise valid.
 - **Settings → Connectors** — connect **GitHub**. It uses OAuth, so a person has to authorise it; this is the one piece the setup script cannot do for you.
 
-Then register the connector, the skill, and the agent:
+Then register the connector, the skill, and the agent. **Choose the model first** — the agent is created with whatever `PORTCULLIS_MODEL` says at that moment, and without it the first configured model wins, which may be the mini-class model that [skips tarball inspection](#what-running-it-for-real-changed):
 
 ```bash
-cd sdk && npm install && npm run create-agent
+cd sdk && npm install
+export PORTCULLIS_MODEL=openai/gpt-5-5      # must be set BEFORE the next line
+npm run create-agent
 ```
 
-Set the model. `gpt-5-5` is what this was built and tested against, and the choice is not cosmetic -- see [What running it for real changed](#what-running-it-for-real-changed):
+`create-agent` is create-or-replace, so if you get this wrong just export the right model and run it again — it updates the existing agent rather than making a second one. The line it prints as `Model :` is the one the agent will actually use; check it.
 
-```bash
-export PORTCULLIS_MODEL=openai/gpt-5-5
-```
-
-Other environment variables: `PORTCULLIS_MODEL` (a fully qualified `provider/model`; otherwise the first configured model is used), `TRUEFORGE_BASE_URL`, `PORTCULLIS_MCP_URL`, `PORTCULLIS_SKILL_REPO`, `PORTCULLIS_SKILL_REF`.
+Other environment variables: `TRUEFORGE_BASE_URL`, `PORTCULLIS_MCP_URL`, `PORTCULLIS_SKILL_REPO`, `PORTCULLIS_SKILL_REF`.
 
 ## Running an audit
 

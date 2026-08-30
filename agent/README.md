@@ -63,9 +63,13 @@ decision anyone needs to confirm.
 `model.name` ships as `REPLACE_WITH_YOUR_MODEL`. `create-agent.mjs` substitutes it,
 in this order:
 
-1. `PORTCULLIS_MODEL`, if set — a fully qualified name such as `openai/gpt-5.2`.
+1. `PORTCULLIS_MODEL`, if set — a fully qualified `provider/model`, e.g. `openai/gpt-5-5`.
+   **Export it before running the script**: the agent is created with whatever the value is
+   at that moment.
 2. Otherwise it asks your TrueForge server which models you have configured and
-   takes the first, printing which one it chose.
+   takes the first, printing which one it chose. Convenient, but not a safe default to
+   rely on — a mini-class model will skip the tarball inspection entirely and still sound
+   certain. Check the `Model :` line the script prints.
 
 So a judge running this does not have to know which provider you happened to use.
 Agent definitions never contain API keys — the model is referenced by name and the
