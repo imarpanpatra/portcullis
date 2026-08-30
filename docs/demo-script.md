@@ -7,6 +7,16 @@ agent stopping for a person before something irreversible.
 Have running beforehand: TrueForge on 8790, the npm MCP server on 8941, a terminal,
 and a throwaway public repo with a `package.json`.
 
+Set the model before the agent is created, and check the `Model :` line:
+
+```bash
+export PORTCULLIS_MODEL=openai/gpt-5-5
+cd sdk && npm run create-agent
+```
+
+A mini-class model skips the tarball inspection and answers from registry data alone,
+which would quietly remove the sandbox from the demo you are about to record.
+
 ## 0:00 — The problem (20s)
 
 > "Adding a dependency is the least-examined write most engineers make. `npm

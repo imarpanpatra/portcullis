@@ -38,6 +38,17 @@ console.log("\n--- get_package_metadata(express, bad version) ---");
 const missing = await getPackageMetadata("express", "999.999.999");
 check("reports an unknown version", Boolean(missing.error), missing.error ?? "");
 
+console.log("\n--- get_package_metadata(express, blank version) ---");
+// A model that does not know the version sends "" rather than omitting the field.
+for (const blank of ["", "   ", null, undefined]) {
+  const resolved = await getPackageMetadata("express", blank);
+  check(
+    `treats ${JSON.stringify(blank)} as latest`,
+    !resolved.error && Boolean(resolved.version),
+    resolved.version ?? resolved.error ?? "",
+  );
+}
+
 console.log("\n--- get_download_stats(express) ---");
 const stats = await getDownloadStats("express");
 check("returns weekly downloads", stats.weekly_downloads > 1_000_000, `${stats.weekly_downloads}`);

@@ -516,12 +516,32 @@ def fetch_repo_tree(repo_url, version):
         return None, "The package does not link to a GitHub repository."
     owner, repo = slug
 
+    # Two failures mean different things. A 404 says the tag is genuinely not there,
+    # which is a fact about the repository. Anything else -- a timeout, a reset
+    # connection -- says only that we could not find out. Keeping just the last
+    # error would let a 404 on the second candidate overwrite a timeout on the
+    # first, and the audit would then report "no such tag" about a tag it never
+    # actually managed to look at.
+    unresolved = []
     for ref in (f"refs/tags/v{version}", f"refs/tags/{version}"):
         url = f"https://codeload.github.com/{owner}/{repo}/tar.gz/{ref}"
         try:
             return fetch(url), None
-        except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
-            continue
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                unresolved.append(f"{ref}: HTTP {error.code}")
+        except Exception as error:  # noqa: BLE001
+            # Deliberately broad. A read that times out raises TimeoutError rather
+            # than URLError, and naming the failures individually means the next
+            # unnamed one escapes and takes a finished package report with it.
+            unresolved.append(f"{ref}: {error}")
+
+    if unresolved:
+        return None, (
+            f"The repository at {owner}/{repo} could not be read ({'; '.join(unresolved)}), so "
+            "the published tarball was not compared against reviewed source. This is not the "
+            "same as the tag being absent -- it is unknown whether it exists."
+        )
 
     return None, (
         f"No tag matching version {version} was found in {owner}/{repo}, so the published "
@@ -616,25 +636,45 @@ def compare_with_source(npm_root, repo_bytes):
             if relative in by_path:
                 if by_path[relative] == published:
                     continue
-                findings.append(
-                    Finding(
-                        # Not capped: both files were read and their contents differ.
-                        # That is a demonstrated substitution, not an inference from
-                        # an index that may be missing entries.
-                        "tarball_source_differs",
-                        "medium" if repo_is_built else "high",
+                # The mismatch itself is proven -- both files were read -- so it is
+                # not capped to low. But the severity leans on repo_is_built, and a
+                # truncated tree can drop the tsconfig that would have set it. So
+                # while the index is incomplete, take the lower of the two readings
+                # and say the classification is uncertain, rather than asserting
+                # "no build step" about a project whose build files may simply be
+                # past the cutoff.
+                # Truncation is asymmetric here. Having *found* a build config or a
+                # compilable file is positive evidence, and dropping later members
+                # cannot un-find it -- so a truncated tree that already said "built"
+                # still knows that. Only the negative is unreliable: not having seen
+                # one may just mean it sat past the cutoff.
+                if repo_truncated and not repo_is_built:
+                    detail = (
                         "This file ships at the same path as one in the repository, but the "
-                        "contents are not the same. Read both before accepting it."
-                        + (
-                            " The project has a build step, so a generated file may legitimately "
-                            "differ from its checked-in form."
-                            if repo_is_built
-                            else " The project has no build step, so there is no ordinary reason "
-                            "for the published copy to differ."
-                        ),
-                        path=relative,
+                        "contents are not the same. Read both before accepting it. The "
+                        "repository tree was only partially read, so whether this project has a "
+                        "build step -- which would explain a generated file differing -- could "
+                        "not be established."
                     )
-                )
+                    severity = "medium"
+                elif repo_is_built:
+                    detail = (
+                        "This file ships at the same path as one in the repository, but the "
+                        "contents are not the same. Read both before accepting it. The project "
+                        "has a build step, so a generated file may legitimately differ from its "
+                        "checked-in form."
+                    )
+                    severity = "medium"
+                else:
+                    detail = (
+                        "This file ships at the same path as one in the repository, but the "
+                        "contents are not the same. Read both before accepting it. The project "
+                        "has no build step, so there is no ordinary reason for the published "
+                        "copy to differ."
+                    )
+                    severity = "high"
+
+                findings.append(Finding("tarball_source_differs", severity, detail, path=relative))
                 continue
 
             candidates = by_stem.get(stem_of(relative), [])
@@ -711,28 +751,32 @@ def summarise(findings):
     return {"counts": counts, "highest_severity": highest, "total": len(findings)}
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Inspect a published npm tarball.")
-    parser.add_argument("--name", required=True)
-    parser.add_argument("--version", required=True)
-    parser.add_argument("--tarball", required=True, help="Tarball URL from get_package_metadata.")
-    parser.add_argument("--repo-url", default=None, help="Linked source repository, if any.")
-    args = parser.parse_args()
+def audit(name, version, tarball_url, repo_url=None):
+    """Inspect one published package and return the report as a dict.
 
+    This is the entry point Code Mode uses. The agent imports this module inside
+    the sandbox and calls this function directly, rather than shelling out to the
+    script -- the sandbox image cannot be relied on to have bash, and a tool that
+    needs a particular shell to exist is a tool that stops working on somebody
+    else's image. Python is the one thing the sandbox is guaranteed to have,
+    because the harness already runs its own client there.
+
+    Never raises for an audit failure: a report saying what could not be checked
+    is worth more to the agent than an exception it has to interpret.
+    """
     report = {
-        "package": args.name,
-        "version": args.version,
+        "package": name,
+        "version": version,
         "findings": [],
         "limitations": [],
         "stats": {},
     }
 
     try:
-        tarball = fetch(args.tarball)
+        tarball = fetch(tarball_url)
     except Exception as error:  # noqa: BLE001 - the agent needs the reason, not a traceback
         report["error"] = f"Could not download the tarball: {error}"
-        print(json.dumps(report, indent=2))
-        return 1
+        return report
 
     report["stats"]["tarball_bytes"] = len(tarball)
 
@@ -741,8 +785,7 @@ def main():
             extraction = safe_extract(tarball, workspace)
         except Exception as error:  # noqa: BLE001
             report["error"] = f"Could not unpack the tarball: {error}"
-            print(json.dumps(report, indent=2))
-            return 1
+            return report
 
         root = package_root(workspace)
         report["stats"]["files_extracted"] = extraction["files"]
@@ -770,7 +813,14 @@ def main():
         except Exception as error:  # noqa: BLE001
             report["limitations"].append(f"Source scan failed: {error}")
 
-        repo_bytes, reason = fetch_repo_tree(args.repo_url, args.version)
+        # Guarded at the call site as well. fetch_repo_tree is careful, but this
+        # function's contract is that it returns a report rather than raising, and
+        # that promise should not depend on one helper staying careful forever.
+        try:
+            repo_bytes, reason = fetch_repo_tree(repo_url, version)
+        except Exception as error:  # noqa: BLE001
+            repo_bytes, reason = None, f"Could not fetch the source repository: {error}"
+
         if repo_bytes is None:
             report["limitations"].append(reason)
         else:
@@ -790,8 +840,21 @@ def main():
 
     report["stats"].setdefault("compared_against_source", False)
     report["summary"] = summarise(report["findings"])
+    return report
+
+
+def main():
+    """Command-line wrapper. Kept so the inspector can be run and tested directly."""
+    parser = argparse.ArgumentParser(description="Inspect a published npm tarball.")
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--tarball", required=True, help="Tarball URL from get_package_metadata.")
+    parser.add_argument("--repo-url", default=None, help="Linked source repository, if any.")
+    args = parser.parse_args()
+
+    report = audit(args.name, args.version, args.tarball, args.repo_url)
     print(json.dumps(report, indent=2))
-    return 0
+    return 1 if report.get("error") else 0
 
 
 if __name__ == "__main__":

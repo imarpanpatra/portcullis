@@ -13,6 +13,7 @@ import os
 import sys
 import tarfile
 import tempfile
+import urllib.error
 import unittest
 from unittest import mock
 
@@ -475,11 +476,17 @@ class TruncatedRepositoryTests(unittest.TestCase):
         for finding in findings:
             self.assertEqual(finding["severity"], "low", finding["check"])
 
-    def test_a_proven_mismatch_keeps_its_severity_despite_truncation(self):
+    def test_a_proven_mismatch_is_reported_despite_truncation(self):
         """Truncation weakens inferences from absence, not a hash comparison.
 
-        Both copies of index.js were read here. That they differ is demonstrated,
-        and unrelated members omitted later in the archive do not make it less so.
+        Both copies of index.js were read here, so that they differ is demonstrated
+        and the finding is not capped down to low the way an absence-based one is.
+
+        It is still not high, though. High is reserved for "the project has no build
+        step, so there is no ordinary reason for this to differ" -- and a partial
+        tree may simply have dropped the tsconfig that would have said otherwise.
+        Medium is the honest reading: the mismatch is real, its explanation is not
+        established.
         """
         npm_root = extract_to_temp(make_tarball({"package.json": "{}", "index.js": "published"}))
         repo = make_tarball(
@@ -491,7 +498,12 @@ class TruncatedRepositoryTests(unittest.TestCase):
             findings, stats = inspector.compare_with_source(npm_root, repo)
 
         self.assertTrue(stats["repo_tree_truncated"])
-        self.assertEqual(severity_of(findings, "tarball_source_differs"), "high")
+        severity = severity_of(findings, "tarball_source_differs")
+        self.assertEqual(severity, "medium")
+        self.assertNotEqual(severity, "low", "a proven mismatch must not be capped away")
+        detail = finding_for(findings, "index.js")["detail"]
+        self.assertIn("could not be established", detail)
+        self.assertNotIn("has no build step", detail)
 
 
 class SummaryTests(unittest.TestCase):
@@ -508,6 +520,107 @@ class SummaryTests(unittest.TestCase):
 
     def test_no_findings_has_no_severity(self):
         self.assertIsNone(inspector.summarise([])["highest_severity"])
+
+
+class ReportContractTests(unittest.TestCase):
+    """audit() promises a report, not an exception. That has to hold under failure."""
+
+    def test_a_repository_timeout_does_not_discard_the_package_findings(self):
+        archive = make_tarball(
+            {"package.json": '{"name":"x","scripts":{"postinstall":"node evil.js"}}'}
+        )
+        calls = []
+
+        def flaky_fetch(url):
+            calls.append(url)
+            if "codeload" in url:
+                raise TimeoutError("read timed out")
+            return archive
+
+        with mock.patch.object(inspector, "fetch", flaky_fetch):
+            report = inspector.audit(
+                "x", "1.0.0", "https://registry.npmjs.org/x.tgz", "https://github.com/o/r"
+            )
+
+        self.assertIsInstance(report, dict)
+        self.assertNotIn("error", report)
+        # The package was still audited; only the comparison was lost.
+        self.assertIn("install_script", checks(report["findings"]))
+        self.assertFalse(report["stats"]["compared_against_source"])
+        self.assertTrue(any("could not be read" in l for l in report["limitations"]), report["limitations"])
+
+    def test_a_tarball_download_failure_returns_a_report_not_an_exception(self):
+        def failing_fetch(url):
+            raise TimeoutError("read timed out")
+
+        with mock.patch.object(inspector, "fetch", failing_fetch):
+            report = inspector.audit("x", "1.0.0", "https://registry.npmjs.org/x.tgz", None)
+
+        self.assertIsInstance(report, dict)
+        self.assertIn("error", report)
+
+    def test_positive_build_evidence_survives_truncation(self):
+        """Truncation can hide a tsconfig; it cannot un-find one already read."""
+        npm_root = extract_to_temp(make_tarball({"package.json": "{}", "index.js": "published"}))
+        repo = make_tarball(
+            {"tsconfig.json": "{}", "index.js": "different"}
+            | {f"src/f{i}.js": "x" for i in range(40)},
+            root="repo-1.0.0",
+        )
+        with mock.patch.object(inspector, "MAX_MEMBERS", 4):
+            findings, stats = inspector.compare_with_source(npm_root, repo)
+
+        self.assertTrue(stats["repo_tree_truncated"])
+        self.assertTrue(stats["repo_has_build_step"])
+        detail = finding_for(findings, "index.js")["detail"]
+        self.assertIn("has a build step", detail)
+        self.assertNotIn("could not be established", detail)
+
+
+class RepoTreeResolutionTests(unittest.TestCase):
+    """"Not found" and "could not look" are different claims and must not merge."""
+
+    @staticmethod
+    def _http_error(code):
+        return urllib.error.HTTPError("u", code, "err", None, None)
+
+    def test_a_genuine_404_on_both_tags_reports_the_tag_as_absent(self):
+        def only_404(url):
+            raise RepoTreeResolutionTests._http_error(404)
+
+        with mock.patch.object(inspector, "fetch", only_404):
+            data, reason = inspector.fetch_repo_tree("https://github.com/o/r", "1.0.0")
+
+        self.assertIsNone(data)
+        self.assertIn("No tag matching", reason)
+
+    def test_a_timeout_is_not_overwritten_by_a_later_404(self):
+        seen = []
+
+        def timeout_then_404(url):
+            seen.append(url)
+            if len(seen) == 1:
+                raise TimeoutError("read timed out")
+            raise RepoTreeResolutionTests._http_error(404)
+
+        with mock.patch.object(inspector, "fetch", timeout_then_404):
+            data, reason = inspector.fetch_repo_tree("https://github.com/o/r", "1.0.0")
+
+        self.assertIsNone(data)
+        self.assertEqual(len(seen), 2)
+        self.assertIn("could not be read", reason)
+        self.assertIn("not the same as the tag being absent", reason)
+        self.assertNotIn("No tag matching", reason)
+
+    def test_a_non_404_http_error_is_also_treated_as_unresolved(self):
+        def server_error(url):
+            raise RepoTreeResolutionTests._http_error(503)
+
+        with mock.patch.object(inspector, "fetch", server_error):
+            data, reason = inspector.fetch_repo_tree("https://github.com/o/r", "1.0.0")
+
+        self.assertIsNone(data)
+        self.assertIn("HTTP 503", reason)
 
 
 class RepoSlugTests(unittest.TestCase):

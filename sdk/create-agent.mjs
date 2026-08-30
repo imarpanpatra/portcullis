@@ -29,9 +29,22 @@ const token = process.env.TRUEFORGE_TOKEN;
 
 const client = new TrueForge({ baseUrl, token, timeoutInSeconds: 120 });
 
+// The SDK's list() calls resolve to { data: [...] } -- the array sits directly on
+// `data`, not nested under a second `data`. Getting that wrong does not throw; it
+// silently yields an empty list, which reads as "nothing is configured" and is a
+// miserable thing to debug. This normalises either shape so the mistake cannot
+// come back.
+function items(response) {
+  const payload = response?.data;
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.data)) return payload.data;
+  return [];
+}
+
 // The SDK exposes list() for skills and connectors but not create(), so these two
 // go over plain HTTP. PUT is create-or-replace, which keeps this script safe to
-// re-run.
+// re-run. Both endpoints expect the resource wrapped in `manifest`, the same shape
+// agents.create takes.
 async function put(resourcePath, body) {
   const response = await fetch(`${baseUrl}${resourcePath}`, {
     method: "PUT",
@@ -50,11 +63,13 @@ async function put(resourcePath, body) {
 async function registerConnector() {
   const url = process.env.PORTCULLIS_MCP_URL ?? "http://localhost:8941/mcp";
   await put("/api/v1/settings/mcp-servers", {
-    name: CONNECTOR_NAME,
-    type: "remote",
-    url,
-    description:
-      "npm registry, download statistics, and OSV advisories. Read-only, no credentials.",
+    manifest: {
+      name: CONNECTOR_NAME,
+      type: "remote",
+      url,
+      description:
+        "npm registry, download statistics, and OSV advisories. Read-only, no credentials.",
+    },
   });
   return url;
 }
@@ -66,15 +81,17 @@ async function registerSkill() {
   const repo = process.env.PORTCULLIS_SKILL_REPO ?? "https://github.com/imarpanpatra/portcullis";
   const ref = process.env.PORTCULLIS_SKILL_REF ?? "main";
   await put("/api/v1/settings/skills", {
-    name: SKILL_NAME,
-    type: "git",
-    url: repo,
-    ref,
-    path: `skills/${SKILL_NAME}`,
-    description:
-      "Decide whether a third-party npm package is safe to admit into a repository: unpack " +
-      "the published tarball in the sandbox, read what actually ships, weigh it against " +
-      "registry signals, and reach a verdict backed by evidence.",
+    manifest: {
+      name: SKILL_NAME,
+      type: "git",
+      url: repo,
+      ref,
+      path: `skills/${SKILL_NAME}`,
+      description:
+        "Decide whether a third-party npm package is safe to admit into a repository: unpack " +
+        "the published tarball in the sandbox, read what actually ships, weigh it against " +
+        "registry signals, and reach a verdict backed by evidence.",
+    },
   });
   return `${repo}@${ref}`;
 }
@@ -88,8 +105,7 @@ async function resolveModel(specModel) {
   if (process.env.PORTCULLIS_MODEL) return process.env.PORTCULLIS_MODEL;
   if (specModel && specModel !== PLACEHOLDER) return specModel;
 
-  const { data } = await client.models.list();
-  const available = data?.data ?? [];
+  const available = items(await client.models.list());
   if (available.length === 0) {
     throw new Error(
       `No models are configured on ${baseUrl}. Open Settings -> Models, add a provider, ` +
@@ -103,26 +119,51 @@ async function resolveModel(specModel) {
 }
 
 /**
- * The GitHub connector is the one piece this script cannot set up. It is an OAuth
- * catalog entry, so a person has to authorise it. Better to say so plainly than to
- * create an agent whose write path silently does not exist.
+ * The GitHub connector is the one piece this script cannot set up: it authenticates
+ * with a personal access token, so a person has to paste one in under
+ * Settings -> Connectors.
+ *
+ * A missing connector is fatal by default. The server rejects the agent anyway, but
+ * the better reason is that an agent quietly created without its write path still
+ * audits packages perfectly well -- it simply can never open a pull request, and
+ * that is not something to discover halfway through a demo.
+ *
+ * --skip-missing-connectors opts into that reduced agent deliberately, which is
+ * useful for exercising the read-only half before a token exists.
  */
-async function checkGithubConnector(required) {
-  if (!required) return true;
-  const { data } = await client.mcpServers.list();
-  const names = (data?.data ?? []).map((server) => server.name);
-  if (names.includes("github")) return true;
+async function resolveConnectors(manifest, allowSkip) {
+  const configured = new Set(items(await client.mcpServers.list()).map((s) => s.name));
+  const missing = manifest.mcp_servers.filter((server) => !configured.has(server.name));
 
-  console.warn("\n  WARNING: no 'github' connector is configured on this server.");
-  console.warn("  The audit will run, but the agent will have nothing to open a pull request");
-  console.warn("  with. Connect it under Settings -> Connectors (it uses OAuth, so it has to");
-  console.warn("  be authorised by a person) and re-run this script.\n");
-  return false;
+  if (missing.length === 0) return manifest;
+  const names = missing.map((server) => server.name).join(", ");
+
+  if (!allowSkip) {
+    throw new Error(
+      [
+        `Referenced by the agent but not configured on the server: ${names}.`,
+        "",
+        "Add them under Settings -> Connectors. GitHub authenticates with a personal",
+        "access token, pasted as an Authorization header.",
+        "",
+        "To create a reduced agent without them on purpose, pass --skip-missing-connectors.",
+        "That agent can audit packages but can never open a pull request.",
+      ].join("\n"),
+    );
+  }
+
+  console.warn(`\n  WARNING: creating a REDUCED agent, without: ${names}`);
+  console.warn("  It can audit packages, but has no way to open a pull request, so the");
+  console.warn("  approval gate is unreachable. Do not record a demo with this agent.\n");
+
+  return {
+    ...manifest,
+    mcp_servers: manifest.mcp_servers.filter((server) => configured.has(server.name)),
+  };
 }
 
 async function findExisting(name) {
-  const { data } = await client.agents.list();
-  return (data?.data ?? []).find((agent) => agent.name === name) ?? null;
+  return items(await client.agents.list()).find((agent) => agent.name === name) ?? null;
 }
 
 async function main() {
@@ -136,24 +177,24 @@ async function main() {
 
   manifest.model.name = await resolveModel(manifest.model?.name);
 
-  const wantsGithub = manifest.mcp_servers.some((server) => server.name === "github");
-  await checkGithubConnector(wantsGithub);
+  const allowSkip = process.argv.includes("--skip-missing-connectors");
+  const resolved = await resolveConnectors(manifest, allowSkip);
 
-  const gated = manifest.mcp_servers.flatMap((server) => server.require_approval_for_tools ?? []);
+  const gated = resolved.mcp_servers.flatMap((server) => server.require_approval_for_tools ?? []);
   console.log(`\nAgent   : ${AGENT_NAME}`);
-  console.log(`Model   : ${manifest.model.name}`);
-  console.log(`Tools   : ${manifest.mcp_servers.map((s) => s.name).join(", ")}`);
-  console.log(`Skills  : ${(manifest.skills ?? []).map((s) => s.name).join(", ") || "none"}`);
-  console.log(`Sandbox : ${manifest.config?.sandbox?.enabled ? "enabled" : "disabled"}`);
-  console.log(`Gated   : ${gated.join(", ")}\n`);
+  console.log(`Model   : ${resolved.model.name}`);
+  console.log(`Tools   : ${resolved.mcp_servers.map((s) => s.name).join(", ")}`);
+  console.log(`Skills  : ${(resolved.skills ?? []).map((s) => s.name).join(", ") || "none"}`);
+  console.log(`Sandbox : ${resolved.config?.sandbox?.enabled ? "enabled" : "disabled"}`);
+  console.log(`Gated   : ${gated.join(", ") || "nothing (no write connector attached)"}\n`);
 
   const existing = await findExisting(AGENT_NAME);
   if (existing) {
-    await client.agents.update(existing.id, { manifest });
+    await client.agents.update(existing.id, { manifest: resolved });
     console.log(`Updated existing agent ${existing.id}`);
   } else {
-    const { data } = await client.agents.create({ name: AGENT_NAME, manifest });
-    console.log(`Created agent ${data?.data?.id ?? data?.id ?? "(id not returned)"}`);
+    const { data } = await client.agents.create({ name: AGENT_NAME, manifest: resolved });
+    console.log(`Created agent ${data?.id ?? data?.data?.id ?? "(id not returned)"}`);
   }
 
   console.log("\nRun an audit with:  node audit.mjs <package> [--repo owner/name]");

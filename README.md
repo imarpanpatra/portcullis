@@ -80,13 +80,17 @@ In the TrueForge UI:
 - **Settings → Sandbox providers** — choose Daytona and paste an API key. The key needs **Snapshots create** permission as well as Sandboxes; without it, configuring the provider fails even though the key is otherwise valid.
 - **Settings → Connectors** — connect **GitHub**. It uses OAuth, so a person has to authorise it; this is the one piece the setup script cannot do for you.
 
-Then register the connector, the skill, and the agent:
+Then register the connector, the skill, and the agent. **Choose the model first** — the agent is created with whatever `PORTCULLIS_MODEL` says at that moment, and without it the first configured model wins, which may be the mini-class model that [skips tarball inspection](#what-running-it-for-real-changed):
 
 ```bash
-cd sdk && npm install && npm run create-agent
+cd sdk && npm install
+export PORTCULLIS_MODEL=openai/gpt-5-5      # must be set BEFORE the next line
+npm run create-agent
 ```
 
-Optional environment variables: `PORTCULLIS_MODEL` (a fully qualified `provider/model`; otherwise the first configured model is used), `TRUEFORGE_BASE_URL`, `PORTCULLIS_MCP_URL`, `PORTCULLIS_SKILL_REPO`, `PORTCULLIS_SKILL_REF`.
+`create-agent` is create-or-replace, so if you get this wrong just export the right model and run it again — it updates the existing agent rather than making a second one. The line it prints as `Model :` is the one the agent will actually use; check it.
+
+Other environment variables: `TRUEFORGE_BASE_URL`, `PORTCULLIS_MCP_URL`, `PORTCULLIS_SKILL_REPO`, `PORTCULLIS_SKILL_REF`.
 
 ## Running an audit
 
@@ -110,6 +114,10 @@ Verified against live packages:
 
 That last row is the one worth defending. The tool's job is to be right, not alarming.
 
+### A real end-to-end run
+
+Audited `left-pad`, raised two `network_egress` candidates, verified both against the shipped files and dropped them as WTFPL licence-comment URLs, set its own condition (pin exactly `1.3.0`, not a caret range), paused three times - `create_branch`, `create_or_update_file`, `create_pull_request` - and on approval opened [portcullis-demo#1](https://github.com/imarpanpatra/portcullis-demo/pull/1) honouring that condition in the diff. Run with `--deny`, it acknowledges the refusal and stops rather than looking for another route.
+
 ## Tests
 
 ```bash
@@ -121,17 +129,37 @@ The offline suite builds every fixture in memory — nothing malicious is downlo
 
 ## Qodo Code Review Evidence
 
-Every substantive change went through a pull request reviewed by [Qodo](https://qodo.ai) before merge.
+Every substantive change went through a pull request reviewed by [Qodo](https://qodo.ai) before merge. Across five pull requests Qodo raised **23 findings**. All 23 were assessed and answered individually in-thread; **22 were valid and fixed**, and one was disputed with the reason recorded.
 
-**Representative merged PR: [#2 — Add the supply-chain audit skill and sandbox inspector](https://github.com/imarpanpatra/portcullis/pull/2)**
+**Representative merged PR: [#2 - Add the supply-chain audit skill and sandbox inspector](https://github.com/imarpanpatra/portcullis/pull/2)** (16 findings over four review rounds)
 
-Across three review rounds on that PR, Qodo raised **14 findings (7 High, 7 Medium)**. All were assessed as valid, **none were dismissed**, and each was fixed and answered individually in its thread. The most consequential: `compare_with_source` computed repository content hashes and then never compared them, so a maliciously modified file published at an existing path passed clean; tarball-only files under `dist/` were reduced to a counter, meaning an injected `dist/index.js` — often the actual entry point — produced no finding at all; and shell scripts were classified as unreadable binaries, so a `postinstall` invoking `install.sh` containing `curl … | bash` skipped the very check written to catch it.
+The findings that mattered most, all in the inspector:
 
-Two rounds are worth reading in full, because the second and third found defects that *my own fixes introduced*: the extraction caps added in round one let a truncated repository tree manufacture false critical findings, and teaching the scanner to read `.sh` files without extending the provenance check left shell scripts only half-examined.
+- `compare_with_source` computed repository content hashes and then never compared them, so a maliciously modified file published at an existing path passed clean.
+- Tarball-only files under `dist/` were reduced to a counter, meaning an injected `dist/index.js` - frequently the actual entry point - produced no finding at all.
+- Shell scripts were classified as unreadable binaries, so a `postinstall` invoking `install.sh` containing `curl ... | bash` skipped the very check written to catch it.
+- Classification was a lowercase extension allowlist, so `INSTALL.SH` and an extensionless `bin/setup` were invisible. Files without an extension are now classified by content. This immediately surfaced esbuild's `bin/esbuild`, which does spawn a subprocess.
 
-On **[#3 — Add the agent spec and the SDK runner](https://github.com/imarpanpatra/portcullis/pull/3)** Qodo raised 3 findings. One was **partly disputed and the disagreement recorded in-thread**: it reported the audit skill as missing, which was an artefact of branch ordering rather than a defect, and I said so. The substantive half of that finding was real and fixed — the runner referenced the skill without ever registering it, so a fresh server would have produced an agent that could not load its own procedure. Another found that the runner collected only approval pauses and not question pauses, which would have terminated the most common path through the agent — the typosquat question — with no verdict.
+**The review found defects that my own fixes introduced.** The extraction caps added in round one let a truncated repository tree manufacture false critical findings. Capping every finding in response then went too far the other way and understated a *proven* content mismatch. Teaching the scanner to read `.sh` files without extending the provenance check left shell scripts half-examined. Three of the four rounds on #2 were corrections to earlier corrections, which is the honest argument for why the review mattered: a single clean pass would have found none of them.
 
-**Trail:** 17 findings, 17 replies, fix commits against each round, and a follow-up review run against the final code on both PRs.
+**The one I disputed:** on [#3](https://github.com/imarpanpatra/portcullis/pull/3) and [#4](https://github.com/imarpanpatra/portcullis/pull/4) Qodo reported the audit skill and the runner as missing. Both were artefacts of branch ordering rather than defects, and I said so in-thread rather than manufacturing a change. The *substantive* half of the #3 finding was real and fixed: the runner referenced the skill without ever registering it, so a fresh server would have produced an agent that could not load its own procedure.
+
+**[#5](https://github.com/imarpanpatra/portcullis/pull/5)** carries everything that only first contact with a live sandbox could reveal, plus two findings that arrived on #2 and #3 after they had merged.
+
+Trail: 23 findings, 23 replies, fix commits against each round, and follow-up reviews run against the final code on every pull request.
+
+## What running it for real changed
+
+Nothing below was reachable from a developer machine, and all of it is in the history:
+
+- **The sandbox had no `bash`.** Every `exec` failed, the agent tried three shell variations, gave up, and answered from registry metadata alone - a confident verdict that had never opened the package. The fix was not to find a shell but to stop needing one: the inspector exposes `audit()` and the skill imports it under Code Mode.
+- **The documented skills path was wrong.** Docs say `/opt/tfy/skills`; the server logs `/opt/tf/skills`.
+- **The model mattered more than the prompt.** On a mini-class model the agent skipped the skill entirely - it has registry tools that answer in a second and a sandbox step that does not, so it took the fast path and sounded equally certain having looked at strictly less. `gpt-5-5` loads the skill and quotes the inspector's own report back. Use it.
+- **`get_package_metadata` rejected its own caller.** A model that does not know the version sends `""`, and `"" ?? latest` is `""`.
+
+### Running on Windows
+
+TrueForge v0.1.4 fails to start on Windows: `kysely`'s `FileMigrationProvider` passes a raw `C:\...` path to `import()`, which Node rejects because `c:` reads as a protocol scheme. Patch `node_modules/kysely/dist/migration/file-migration-provider.js` to wrap the path in `pathToFileURL(filePath).href`. Note also that the local sandbox fallback is macOS and Linux only, so Daytona is required rather than optional.
 
 ## AI assistance disclosure
 

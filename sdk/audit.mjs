@@ -47,13 +47,38 @@ const client = new TrueForge({
 
 const rule = (label) => console.log(`\n${"-".repeat(72)}\n${label}\n${"-".repeat(72)}`);
 
+// Answers are read from a queue rather than with readline.question().
+//
+// readline drains its input to EOF and drops whatever nobody asked for yet, so
+// piping answers in works for the first prompt and then fails with "readline was
+// closed" -- which looks like a crash and is really just a lost buffer. Queueing
+// every line as it arrives means a run can be answered interactively or from a
+// script, without the tool having to offer a blanket approve-everything flag.
+const pending = [];
+const waiting = [];
+let inputClosed = false;
+
+const reader = readline.createInterface({ input: stdin, crlfDelay: Infinity });
+reader.on("line", (line) => {
+  const waiter = waiting.shift();
+  if (waiter) waiter(line);
+  else pending.push(line);
+});
+reader.on("close", () => {
+  inputClosed = true;
+  while (waiting.length) waiting.shift()(null);
+});
+
+/** Resolves to the next line, or null when there is nobody left to answer. */
 async function ask(prompt) {
-  const rl = readline.createInterface({ input: stdin, output: stdout });
-  try {
-    return (await rl.question(prompt)).trim();
-  } finally {
-    rl.close();
-  }
+  stdout.write(prompt);
+  if (pending.length) return pending.shift().trim();
+  if (inputClosed) return null;
+  return new Promise((resolve) => waiting.push((line) => resolve(line?.trim() ?? null)));
+}
+
+function closePrompt() {
+  reader.close();
 }
 
 /**
@@ -144,6 +169,12 @@ async function answerQuestions(calls) {
     });
 
     const reply = await ask(options.length ? "\nchoose a number, or type an answer: " : "\nanswer: ");
+    if (reply === null) {
+      throw new Error(
+        "The agent asked a question and stdin ended before an answer arrived. " +
+          "Re-run with the answer piped in, or answer it interactively.",
+      );
+    }
     const chosen = options[Number(reply) - 1];
     const content =
       chosen === undefined
@@ -169,11 +200,18 @@ async function decideApprovals(calls) {
     console.log(`args: ${JSON.stringify(call.arguments, null, 2)}`);
   }
 
-  const decision = args.deny
-    ? { status: "deny", reason: "denied by the operator" }
-    : (await ask(`\nAllow ${calls.length} call(s)? [y/N] `)).toLowerCase().startsWith("y")
+  let decision;
+  if (args.deny) {
+    decision = { status: "deny", reason: "denied by the operator" };
+  } else {
+    const answer = await ask(`\nAllow ${calls.length} call(s)? [y/N] `);
+    // A null answer means stdin ended without one. Fail closed: no operator is a
+    // reason to refuse, never a reason to proceed. The prompt defaults to no for
+    // the same reason -- an accidental Enter must not authorise a write.
+    decision = answer?.toLowerCase().startsWith("y")
       ? { status: "allow" }
-      : { status: "deny", reason: "denied by the operator" };
+      : { status: "deny", reason: answer === null ? "no operator available to approve" : "denied by the operator" };
+  }
 
   console.log(`\n${decision.status === "allow" ? "APPROVED" : "DENIED"} - resuming\n`);
   return calls.map((call) => ({
@@ -200,7 +238,20 @@ async function main() {
     const { events, pendingApprovals, pendingQuestions } = await runTurn(session.id, input);
 
     if (pendingApprovals.length === 0 && pendingQuestions.length === 0) {
+      closePrompt();
       rule("done");
+      return;
+    }
+
+    // Check the budget before asking, not after. Collecting an approval and then
+    // falling out of the loop without submitting it would print "APPROVED" while
+    // the write never happened -- worse than refusing, because the operator is
+    // told the opposite of the truth. If there is no round left to spend, say so
+    // and ask for nothing.
+    if (round === MAX_ROUNDS - 1) {
+      closePrompt();
+      rule(`stopped after ${MAX_ROUNDS} rounds of pauses; nothing further was submitted`);
+      console.log("The agent was still waiting. Re-run to continue the audit.");
       return;
     }
 
@@ -220,7 +271,8 @@ async function main() {
     input = next;
   }
 
-  rule(`stopped after ${MAX_ROUNDS} rounds of pauses`);
+  closePrompt();
+  rule(`stopped after ${MAX_ROUNDS} rounds`);
 }
 
 main().catch((error) => {
