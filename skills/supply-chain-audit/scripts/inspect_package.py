@@ -636,25 +636,40 @@ def compare_with_source(npm_root, repo_bytes):
             if relative in by_path:
                 if by_path[relative] == published:
                     continue
-                findings.append(
-                    Finding(
-                        # Not capped: both files were read and their contents differ.
-                        # That is a demonstrated substitution, not an inference from
-                        # an index that may be missing entries.
-                        "tarball_source_differs",
-                        "medium" if repo_is_built else "high",
+                # The mismatch itself is proven -- both files were read -- so it is
+                # not capped to low. But the severity leans on repo_is_built, and a
+                # truncated tree can drop the tsconfig that would have set it. So
+                # while the index is incomplete, take the lower of the two readings
+                # and say the classification is uncertain, rather than asserting
+                # "no build step" about a project whose build files may simply be
+                # past the cutoff.
+                if repo_truncated:
+                    detail = (
                         "This file ships at the same path as one in the repository, but the "
-                        "contents are not the same. Read both before accepting it."
-                        + (
-                            " The project has a build step, so a generated file may legitimately "
-                            "differ from its checked-in form."
-                            if repo_is_built
-                            else " The project has no build step, so there is no ordinary reason "
-                            "for the published copy to differ."
-                        ),
-                        path=relative,
+                        "contents are not the same. Read both before accepting it. The "
+                        "repository tree was only partially read, so whether this project has a "
+                        "build step -- which would explain a generated file differing -- could "
+                        "not be established."
                     )
-                )
+                    severity = "medium"
+                elif repo_is_built:
+                    detail = (
+                        "This file ships at the same path as one in the repository, but the "
+                        "contents are not the same. Read both before accepting it. The project "
+                        "has a build step, so a generated file may legitimately differ from its "
+                        "checked-in form."
+                    )
+                    severity = "medium"
+                else:
+                    detail = (
+                        "This file ships at the same path as one in the repository, but the "
+                        "contents are not the same. Read both before accepting it. The project "
+                        "has no build step, so there is no ordinary reason for the published "
+                        "copy to differ."
+                    )
+                    severity = "high"
+
+                findings.append(Finding("tarball_source_differs", severity, detail, path=relative))
                 continue
 
             candidates = by_stem.get(stem_of(relative), [])

@@ -243,6 +243,18 @@ async function main() {
       return;
     }
 
+    // Check the budget before asking, not after. Collecting an approval and then
+    // falling out of the loop without submitting it would print "APPROVED" while
+    // the write never happened -- worse than refusing, because the operator is
+    // told the opposite of the truth. If there is no round left to spend, say so
+    // and ask for nothing.
+    if (round === MAX_ROUNDS - 1) {
+      closePrompt();
+      rule(`stopped after ${MAX_ROUNDS} rounds of pauses; nothing further was submitted`);
+      console.log("The agent was still waiting. Re-run to continue the audit.");
+      return;
+    }
+
     const next = [];
 
     if (pendingQuestions.length > 0) {
@@ -260,7 +272,7 @@ async function main() {
   }
 
   closePrompt();
-  rule(`stopped after ${MAX_ROUNDS} rounds of pauses`);
+  rule(`stopped after ${MAX_ROUNDS} rounds`);
 }
 
 main().catch((error) => {

@@ -476,11 +476,17 @@ class TruncatedRepositoryTests(unittest.TestCase):
         for finding in findings:
             self.assertEqual(finding["severity"], "low", finding["check"])
 
-    def test_a_proven_mismatch_keeps_its_severity_despite_truncation(self):
+    def test_a_proven_mismatch_is_reported_despite_truncation(self):
         """Truncation weakens inferences from absence, not a hash comparison.
 
-        Both copies of index.js were read here. That they differ is demonstrated,
-        and unrelated members omitted later in the archive do not make it less so.
+        Both copies of index.js were read here, so that they differ is demonstrated
+        and the finding is not capped down to low the way an absence-based one is.
+
+        It is still not high, though. High is reserved for "the project has no build
+        step, so there is no ordinary reason for this to differ" -- and a partial
+        tree may simply have dropped the tsconfig that would have said otherwise.
+        Medium is the honest reading: the mismatch is real, its explanation is not
+        established.
         """
         npm_root = extract_to_temp(make_tarball({"package.json": "{}", "index.js": "published"}))
         repo = make_tarball(
@@ -492,7 +498,12 @@ class TruncatedRepositoryTests(unittest.TestCase):
             findings, stats = inspector.compare_with_source(npm_root, repo)
 
         self.assertTrue(stats["repo_tree_truncated"])
-        self.assertEqual(severity_of(findings, "tarball_source_differs"), "high")
+        severity = severity_of(findings, "tarball_source_differs")
+        self.assertEqual(severity, "medium")
+        self.assertNotEqual(severity, "low", "a proven mismatch must not be capped away")
+        detail = finding_for(findings, "index.js")["detail"]
+        self.assertIn("could not be established", detail)
+        self.assertNotIn("has no build step", detail)
 
 
 class SummaryTests(unittest.TestCase):
